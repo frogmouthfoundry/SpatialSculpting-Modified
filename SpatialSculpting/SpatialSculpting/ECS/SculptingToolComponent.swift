@@ -22,7 +22,7 @@ let sculptingColor: [SculptingMode: UIColor] = [
 struct SculptingToolComponent: Component {
     let sculptor: MarchingCubesMeshSculptor
     var mode: SculptingMode = .remove
-    var radius: Float = 0.035
+    var radius: Float = 0.005
     var isActive: Bool = false
     var reset: Bool = true
     var clear: Bool = false
@@ -44,13 +44,7 @@ struct SculptingToolSystem: ComputeSystem {
                 continue
             }
             
-            sculptingToolComponent.radius = simd_clamp(sculptingToolComponent.radius, 0.01, 0.5)
-            
-            // Display the current sculpting mode and size on the tooltip.
-            sculptingToolComponent.tooltip?.components[ModelComponent.self]?.materials = [
-                SimpleMaterial(color: sculptingColor[sculptingToolComponent.mode]!, isMetallic: false)
-            ]
-            sculptingToolComponent.tooltip?.scale = SIMD3<Float>(repeating: sculptingToolComponent.radius)
+            sculptingToolComponent.radius = simd_clamp(sculptingToolComponent.radius, 0.002, 0.5)
 
             // Reset the sculpture to a box.
             if sculptingToolComponent.reset {
@@ -86,6 +80,9 @@ struct SculptingToolSystem: ComputeSystem {
                                                 previousPositionAndHasPosition: previousPositionAndActive)
                 sculptingToolComponent.sculptor.sculpt(sculptParams: sculptParams, computeContext: &computeContext)
             }
+
+            // Sample the SDF at the tool position so the CPU can detect mesh contact.
+            sculptingToolComponent.sculptor.sampleSDF(at: sculptingTool.position, computeContext: &computeContext)
 
             // Save the completed sculpture to a file.
             if let (destinationTexture, onCompletion) = sculptingToolComponent.saveToTexture {

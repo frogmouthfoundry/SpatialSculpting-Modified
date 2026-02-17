@@ -76,6 +76,20 @@ void clearVolume(texture3d<float, access::write> voxels [[texture(0)]],
     voxels.write(distance, voxelCoords);
 }
 
+// Single-thread kernel that reads the SDF value at a given world position
+// and writes it to a CPU-readable buffer.
+[[kernel]]
+void sampleSDF(texture3d<float, access::read> voxels [[texture(0)]],
+               constant VolumeParams &params [[buffer(0)]],
+               constant float3 &worldPosition [[buffer(1)]],
+               device float &result [[buffer(2)]],
+               uint3 threadPos [[thread_position_in_grid]]) {
+    // Convert world position to voxel coordinates
+    float3 voxelCoordF = (worldPosition - params.voxelStartPosition) / params.voxelSize;
+    uint3 voxelCoord = uint3(clamp(voxelCoordF, float3(0), float3(params.dimensions - 1)));
+    result = voxels.read(voxelCoord).r;
+}
+
 [[kernel]]
 void sculpt(texture3d<float, access::read> voxelsIn [[texture(0)]],
             texture3d<float, access::write> voxelsOut [[texture(1)]],
@@ -107,7 +121,7 @@ void sculpt(texture3d<float, access::read> voxelsIn [[texture(0)]],
     }
 
     // Combine the distance of the tool with the distance already in the voxel volume, depending on the mode.
-    voxelValue = sculptParams.mode == add ? smoothUnion(distance, voxelValue, 0.01) : smoothSubtraction(distance, voxelValue, 0.01);
+    voxelValue = sculptParams.mode == add ? smoothUnion(distance, voxelValue, 0.002) : smoothSubtraction(distance, voxelValue, 0.002);
 
     // Write the distance back to the voxel texture.
     voxelsOut.write(voxelValue, voxelCoords);

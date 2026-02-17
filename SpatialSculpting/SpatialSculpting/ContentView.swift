@@ -21,7 +21,6 @@ struct ContentView: View {
     let sculptor: MarchingCubesMeshSculptor!
 
     @State var saveDocument: VolumeDocument? = nil
-    @State var isOpening = false
     @State var isSaving = false
 
     init() {
@@ -245,32 +244,18 @@ struct ContentView: View {
 
     func openButton() -> some View {
         Button {
-            isOpening = true
+            guard let url = Bundle.main.url(forResource: "MyModel", withExtension: "volume") else {
+                print("Failed to find MyModel.")
+                return
+            }
+            
+            do {
+                try sculpting.loadFromURL(url)
+            } catch {
+                print("Failed to open document: \(error)")
+            }
         } label: {
             Text("Open")
-        }
-        .fileImporter(isPresented: $isOpening, allowedContentTypes: [VolumeDocument.utType], allowsMultipleSelection: false) { result in
-            switch result {
-            case .success(let success):
-                do {
-                    //let url = success[0].absoluteURL
-                    
-                    //Hijack the load URL for own load model
-                    guard let url = Bundle.main.url(forResource: "MyModel", withExtension: "volume") else {
-                        print("Failed to find MyModel.")
-                        return
-                    }
-                    
-                    try sculpting.loadFromURL(url)
-                } catch {
-                    print("Failed to open document: \(error)")
-                }
-            case .failure(let error):
-                print("Error opening: \(error)")
-            }
-            isOpening = false
-        } onCancellation: {
-            isOpening = false
         }
     }
 
