@@ -34,7 +34,7 @@ final class SculptingToolModel {
     var drillModelEntity: Entity? = nil
     var drillBallEntity: ModelEntity? = nil
 
-    // Tracks carving state for logging
+    // Tracks carving state for logging and particle bursts
     private var wasCarving: Bool = false
     
     /// Manages the drawing of bone debris box volumes when the tool contacts the sculpted volume.
@@ -175,6 +175,9 @@ final class SculptingToolModel {
             let isCarving = sdf <= 0
             if isCarving != wasCarving {
                 print(isCarving ? "[Drill] Carving" : "[Drill] Idle")
+                if isCarving {
+                    triggerBoneDustBurst()
+                }
                 wasCarving = isCarving
             }
         }
@@ -195,6 +198,28 @@ final class SculptingToolModel {
         entity.components.set(CollisionComponent(shapes: [.generateBox(size: .init(repeating: 0.05))]))
         entity.name = name
         rootEntity?.addChild(entity)
+    }
+
+    // MARK: - Bone Dust Particles
+
+    /// Spawn a fresh BoneDust entity at the drill tip, let it play, then destroy it.
+    private func triggerBoneDustBurst() {
+        guard let root = rootEntity else { return }
+        let spawnPosition = sculptingTool.position
+
+        Task { @MainActor in
+            guard let dustEntity = try? await Entity(named: "BoneDust") else {
+                print("[BoneDust] Failed to load BoneDust.usdz")
+                return
+            }
+
+            dustEntity.position = spawnPosition
+            root.addChild(dustEntity)
+
+            // Let the particles play for a short duration, then remove
+            try? await Task.sleep(for: .milliseconds(1500))
+            dustEntity.removeFromParent()
+        }
     }
 
 }
