@@ -31,19 +31,50 @@ extension SculptingToolModel {
     // failing due to reduced sensor coverage.
     @MainActor
     func addSculptingTooltip(to entity: AnchorEntity) {
-        let tooltipEntity = ModelEntity(mesh: .generateSphere(radius: 1.0), materials: [SimpleMaterial(color: .purple, isMetallic: true)])
-        entity.addChild(tooltipEntity)
-        sculptingTool.components[SculptingToolComponent.self]?.tooltip = tooltipEntity
-        
-        trackingStateIndicator = ModelEntity(mesh: .generateSphere(radius: 0.02), materials:
-                                            [SimpleMaterial(color: trackingStateColor[.positionOrientationTracked]!,
-                                            isMetallic: false)])
-        trackingStateIndicator?.transform = .init(translation: SIMD3<Float>(0.1, 0, 0))
-
-        if let trackingStateIndicator = trackingStateIndicator {
-            entity.addChild(trackingStateIndicator)
-        }
+        // Tooltip sphere removed — the drill ball now serves as the visual indicator.
         sculptingEntity = entity
+    }
+    
+    /// Load the Drill.usdz model from the bundle and attach it to the anchor,
+    /// together with a spinning drill ball at the tip.
+    @MainActor
+    func attachDrillModel(to anchor: AnchorEntity) async {
+        // Load drill model from bundle
+        guard let drillModel = try? await ModelEntity(named: "Drill") else {
+            print("Failed to load Drill.usdz")
+            return
+        }
+
+        // Scale so the drill is roughly 17.5 cm long (matching ToolChange_Drill)
+        let targetLength: Float = 0.175
+        let bounds = drillModel.visualBounds(relativeTo: nil)
+        let modelLength = max(bounds.extents.x, max(bounds.extents.y, bounds.extents.z))
+        if modelLength > 0 {
+            let scaleFactor = targetLength / modelLength
+            drillModel.scale = SIMD3<Float>(repeating: scaleFactor)
+        }
+
+        // Position so the tip of the model sits at the anchor origin.
+        // The drill model extends along +Z; shift it so the front (min Z) is at origin.
+        let scaledBounds = drillModel.visualBounds(relativeTo: nil)
+        let center = scaledBounds.center
+        let extents = scaledBounds.extents
+        drillModel.position = SIMD3<Float>(
+            -center.x,
+            -center.y,
+            -center.z + extents.z / 2 - 0.05
+        )
+
+        anchor.addChild(drillModel)
+        drillModelEntity = drillModel
+
+        // Create spinning drill ball at the tip
+        let drillBall = DrillRotationComponent.createDrillBall(rpm: 400)
+        drillBall.position = SIMD3<Float>(-0.005, 0.001, -0.04)
+        anchor.addChild(drillBall)
+        drillBallEntity = drillBall
+
+        print("Drill model and rotating ball attached to accessory")
     }
     
     // Anchor via AnchorEntity to a GCDevice.
@@ -66,12 +97,18 @@ extension SculptingToolModel {
         
         addSculptingTooltip(to: sculptingEntity)
         
+        // Attach the drill overlay model and spinning ball
+        await attachDrillModel(to: sculptingEntity)
+        
         // Set up inputs to take in controller or stylus style inputs.
         if let stylus = device as? GCStylus {
             setupStylusInputs(stylus: stylus, hapticsModel: hapticsModel)
         } else if let controller = device as? GCController {
             setupControllerInputs(controller: controller, hapticsModel: hapticsModel)
         }
+
+        // Haptics disabled for now
+        // hapticsModel.startIdleVibration()
     }
     
 }

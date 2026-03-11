@@ -21,7 +21,6 @@ struct ContentView: View {
     let sculptor: MarchingCubesMeshSculptor!
 
     @State var saveDocument: VolumeDocument? = nil
-    @State var isOpening = false
     @State var isSaving = false
 
     init() {
@@ -39,18 +38,6 @@ struct ContentView: View {
         self.marchingCubesMesh = try? MarchingCubesMesh(voxelVolume: voxelVolume)
         self.sculptor = MarchingCubesMeshSculptor(marchingCubesMesh: marchingCubesMesh)
         
-        //initialize to loaded model
-        guard let url = Bundle.main.url(forResource: "MyModel", withExtension: "volume") else {
-            print("Failed to find MyModel.")
-            return
-        }
-        
-        do {
-            try sculpting.loadFromURL(url)
-        } catch {
-            print("Failed to load model document: \(error)")
-        }
-        //
     }
     
     /*
@@ -65,81 +52,32 @@ struct ContentView: View {
     
     
     //NEW MESH CHUNK ENTITY FUNCTION
-    func createMeshChunkEntity(meshChunk: MarchingCubesMeshChunk) throws -> Entity {
-        let mesh = try MeshResource(from: meshChunk.mesh)
+    func createMeshChunkEntity(meshChunk: MarchingCubesMeshChunk) async throws -> Entity {
+        let mesh = try await MeshResource(from: meshChunk.mesh)
         let meshChunkEntity = Entity()
 
-        // Load a texture from your asset catalog or bundle
         guard let textureResource = try? TextureResource.load(named: "MyAlbedo") else {
-            // Fallback to a flat brown color if the texture is missing
             meshChunkEntity.components.set(
                 ModelComponent(mesh: mesh, materials: [SimpleMaterial(color: .brown, roughness: 0.95, isMetallic: false)])
             )
-            // Still add collision even on fallback path.
-            addChunkPhysics(to: meshChunkEntity, meshChunk: meshChunk)
             return meshChunkEntity
         }
 
-        // Create a physically based material and assign the texture as the base color using the proper API
         var material = PhysicallyBasedMaterial()
-        // Base color takes a BaseColor value. Provide a texture by wrapping the TextureResource in a MaterialParameters.Texture
         material.baseColor = PhysicallyBasedMaterial.BaseColor(texture: .init(textureResource))
 
-        // Try to load and apply a normal map
         if let normalMap = try? TextureResource.load(named: "MyNormal") {
             material.normal = .init(texture: .init(normalMap))
         }
 
-        // Optional: add normal/metallic/roughness if you have them
-        // if let normalMap = try? TextureResource.load(named: "StoneNormal") {
-        //     material.normal = .init(texture: .init(normalMap))
-        // }
         material.metallic = .init(floatLiteral: 0.0)
         material.roughness = .init(floatLiteral: 0.95)
 
         meshChunkEntity.components.set(ModelComponent(mesh: mesh, materials: [material]))
         
-        // Add collision + static physics body so bone debris can collide with the volume.
-        addChunkPhysics(to: meshChunkEntity, meshChunk: meshChunk)
-        
         return meshChunkEntity
     }//end New createMeshChunk function
-    
-    /// Adds a static collision box and physics body to a mesh chunk entity.
-    /// The box covers the chunk's bounding region so bone debris bounces off the sculpted volume.
-    private func addChunkPhysics(to entity: Entity, meshChunk: MarchingCubesMeshChunk) {
-        let params = meshChunk.params
-        
-        // Reconstruct the chunk's bounding box from its params
-        // (mirrors the bounds calculation in MarchingCubesMesh.createMeshChunk).
-        let voxelSize = params.voxelSize
-        let chunkDims = SIMD3<Float>(params.chunkDimensions)
-        let chunkVoxelStart = params.voxelStartPosition
-                              + Float(params.chunkStartZ) * SIMD3<Float>(0, 0, voxelSize.z)
-        
-        let boundsMin = chunkVoxelStart - voxelSize / 2
-        let boundsMax = chunkVoxelStart + voxelSize * chunkDims + voxelSize / 2
-        let boundsSize = boundsMax - boundsMin
-        let boundsCenter = (boundsMin + boundsMax) / 2
-        
-        // Create a box shape covering this chunk's region, offset to the correct center.
-        let shape = ShapeResource.generateBox(
-            width:  boundsSize.x,
-            height: boundsSize.y,
-            depth:  boundsSize.z
-        ).offsetBy(rotation: simd_quatf(ix: 0, iy: 0, iz: 0, r: 1),
-                   translation: boundsCenter)
-        
-        entity.components.set(CollisionComponent(shapes: [shape]))
-        entity.components.set(PhysicsBodyComponent(
-            shapes: [shape],
-            mass: 0,
-            material: .default,
-            mode: .static
-        ))
-    }
      
-
     func sculptingVolume() -> some View {
         RealityView { content, attachments in
             
@@ -147,7 +85,7 @@ struct ContentView: View {
             // Create an entity to render each mesh chunk.
             if let meshChunks = marchingCubesMesh?.meshChunks {
                 for meshChunk in meshChunks {
-                    if let meshChunkEntity = try? createMeshChunkEntity(meshChunk: meshChunk) {
+                    if let meshChunkEntity = try? await createMeshChunkEntity(meshChunk: meshChunk) {
                         root.addChild(meshChunkEntity)
                     }
                 }
@@ -162,6 +100,13 @@ struct ContentView: View {
             
             // Set up the bone debris manager with the root entity.
             sculpting.boneDebrisManager.setup(rootEntity: root)
+            
+            // Set up the collision manager with direct SDF access.
+            if let voxelVolume = marchingCubesMesh?.voxelVolume {
+                sculpting.collisionManager.setup(rootEntity: root, voxelVolume: voxelVolume)
+            }
+            // Schedule initial collision generation (delay for GPU to render first mesh).
+            sculpting.collisionManager.scheduleRegeneration()
             
             // Update sculpting tool and check for tracking quality each frame.
             _ = content.subscribe(to: SceneEvents.Update.self) {
@@ -245,38 +190,26 @@ struct ContentView: View {
 
     func openButton() -> some View {
         Button {
-            isOpening = true
+            guard let url = Bundle.main.url(forResource: "MyModel", withExtension: "volume") else {
+                print("Failed to find MyModel.")
+                return
+            }
+            
+            do {
+                try sculpting.loadFromURL(url)
+                sculpting.collisionManager.scheduleRegeneration()
+            } catch {
+                print("Failed to open document: \(error)")
+            }
         } label: {
             Text("Open")
-        }
-        .fileImporter(isPresented: $isOpening, allowedContentTypes: [VolumeDocument.utType], allowsMultipleSelection: false) { result in
-            switch result {
-            case .success(let success):
-                do {
-                    //let url = success[0].absoluteURL
-                    
-                    //Hijack the load URL for own load model
-                    guard let url = Bundle.main.url(forResource: "MyModel", withExtension: "volume") else {
-                        print("Failed to find MyModel.")
-                        return
-                    }
-                    
-                    try sculpting.loadFromURL(url)
-                } catch {
-                    print("Failed to open document: \(error)")
-                }
-            case .failure(let error):
-                print("Error opening: \(error)")
-            }
-            isOpening = false
-        } onCancellation: {
-            isOpening = false
         }
     }
 
     func clearButton() -> some View {
         Button {
             sculpting.sculptingTool.components[SculptingToolComponent.self]?.clear = true
+            sculpting.collisionManager.scheduleRegeneration()
         } label: {
             Text("Clear")
         }
@@ -285,6 +218,7 @@ struct ContentView: View {
     func resetButton() -> some View {
         Button {
             sculpting.sculptingTool.components[SculptingToolComponent.self]?.reset = true
+            sculpting.collisionManager.scheduleRegeneration()
         } label: {
             Text("Reset")
         }
@@ -324,9 +258,19 @@ struct ContentView: View {
         }
     }
     
-    //Final View
+    func dropSphereButton() -> some View {
+        Button {
+            sculpting.collisionManager.dropTestSphere()
+        } label: {
+            Text("Drop Sphere")
+        }
+    }
+    
+    //Final Consolidated View
     var body: some View {
         ZStack {
+            
+            //Sculpt Volume
             sculptingVolume()
                 .ornament(attachmentAnchor: .scene(.bottomFront)) {
                     HStack {
@@ -338,8 +282,25 @@ struct ContentView: View {
                         clearDebrisButton()
                         toggleGravityButton()
                         diagnoseButton()
+                        dropSphereButton()
                     }.padding().glassBackgroundEffect()
                 }
+            //end Sculpting Volume
+            
+            /*
+            //Additional 3D Content
+            RealityView { content in
+                
+                guard let stageEntity = try? Entity.load(named: "Staging") else {
+                    print("❌ Failed to find Staging Entity")
+                    return }
+                
+                stageEntity.scale *= 0.3
+                //stageEntity.transform.translation += SIMD3(0,0,0.1)
+                content.add(stageEntity)
+            }
+            //end Additional 3D Content
+             */
         }
     }
 }

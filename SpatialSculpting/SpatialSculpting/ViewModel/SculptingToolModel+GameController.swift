@@ -16,15 +16,11 @@ extension SculptingToolModel {
     func setupStylusInputs(stylus: GCStylus, hapticsModel: HapticsModel) {
         if let input = stylus.input {
             let buttonSidePrimary = input.buttons[.stylusPrimaryButton] // Primary side button
-            let buttonSideSecondary = input.buttons[.stylusSecondaryButton] // Secondary side button
             buttonSidePrimary?.pressedInput.pressedDidChangeHandler = { _, _, pressed in
                 self.handlePalettePress(pressed: pressed)
             }
             
-            buttonSideSecondary?.pressedInput.pressedDidChangeHandler = { _, _, pressed in
-                self.sculptingTool.components[SculptingToolComponent.self]?.isActive = pressed
-                hapticsModel.handleSculptHaptics(pressed: pressed)
-            }
+            // Secondary button removed - sculpting is now always active when tracked
         }
         if let haptics = stylus.haptics {
             hapticsModel.setupHaptics(haptics: haptics)
@@ -36,10 +32,7 @@ extension SculptingToolModel {
     func setupControllerInputs(controller: GCController, hapticsModel: HapticsModel) {
         let input = controller.input
         
-        input.buttons[.trigger]?.pressedInput.pressedDidChangeHandler = { _, _, pressed in
-            self.sculptingTool.components[SculptingToolComponent.self]?.isActive = pressed
-            hapticsModel.handleSculptHaptics(pressed: pressed)
-        }
+        // Trigger removed - sculpting is now always active when tracked
         
         input.buttons[.thumbstickButton]?.pressedInput.pressedDidChangeHandler = { _, _, pressed in
             self.handlePalettePress(pressed: pressed)

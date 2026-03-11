@@ -12,6 +12,7 @@ struct SpatialSculptingApp: App {
 
     init() {
         ComputeDispatchSystem.registerSystem()
+        DrillRotationSystem.registerSystem()
     }
     
     var body: some Scene {

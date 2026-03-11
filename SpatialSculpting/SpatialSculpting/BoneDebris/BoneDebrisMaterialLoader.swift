@@ -20,13 +20,9 @@ struct BoneDebrisMaterialLoader {
         alpha: 1.0
     )
     
-    /// The name of the material entity to look for in the RealityKit content bundle.
+    //Material Names
     static let bundleMaterialName = "BoneDebrisMaterial"
-    
-    /// The name of the physics material to look for in the RealityKit content bundle.
     static let bundlePhysicsMaterialName = "BoneDebrisPhysicsMaterial"
-    
-    /// The name of the normal map texture to look for in the asset catalog.
     static let bundleNormalTextureName = "BoneDebrisNormal"
     
     // MARK: - Material Loading
@@ -36,14 +32,14 @@ struct BoneDebrisMaterialLoader {
     /// default color #E3DAC9 and an optional normal map if one is present
     /// in the asset catalog under `BoneDebrisNormal`.
     static func loadDebrisMaterial() -> any Material {
-        // Attempt 1: Load from a .reality or .usdz file in the bundle that contains a named material.
+        // Option 1: Load from a .reality or .usdz file in the bundle that contains a named material.
         if let debrisEntity = try? Entity.load(named: bundleMaterialName, in: nil),
            let modelComponent = debrisEntity.components[ModelComponent.self],
            let material = modelComponent.materials.first {
             return material
         }
         
-        // Attempt 2: Try loading from the RealityKitContent bundle if available.
+        // Option 2: Try loading from the RealityKitContent bundle if available.
         if let rkBundle = Bundle(identifier: "com.apple.RealityKitContent"),
            let debrisEntity = try? Entity.load(named: bundleMaterialName, in: rkBundle),
            let modelComponent = debrisEntity.components[ModelComponent.self],
@@ -51,7 +47,7 @@ struct BoneDebrisMaterialLoader {
             return material
         }
         
-        // Attempt 3: Build a PBR material from asset catalog textures + normal map.
+        // Option 3: Build a PBR material from asset catalog textures + normal map.
         var pbrMaterial = PhysicallyBasedMaterial()
         
         // Base color: try loading a texture named "BoneDebrisMaterial", else use default tint.

@@ -12,7 +12,7 @@ import ARKit
 @MainActor @Observable
 final class SculptingToolModel {
     // Min and max radii of the sculpting tool.
-    let minRadius: Float = 0.01
+    let minRadius: Float = 0.002
     let maxRadius: Float = 0.5
 
     var rootEntity: Entity? = nil // The root entity in the RealityView.
@@ -29,9 +29,19 @@ final class SculptingToolModel {
     var reduceIcon: Entity? = nil
 
     var hapticsModel: HapticsModel? = nil
+
+    // Drill overlay entities
+    var drillModelEntity: Entity? = nil
+    var drillBallEntity: ModelEntity? = nil
+
+    // Tracks carving state for logging and particle bursts
+    private var wasCarving: Bool = false
     
     /// Manages the drawing of bone debris box volumes when the tool contacts the sculpted volume.
     let boneDebrisManager = BoneDebrisManager()
+    
+    /// Manages collision generation for the sculpting volume via CPU marching cubes.
+    let collisionManager = CollisionManager()
 
     // Raycast from the accessory to the add/subtract elements of the toolbar to swap to
     // the different controls.
@@ -143,6 +153,27 @@ final class SculptingToolModel {
     // Every frame, update the interactions with in-app content
     // from the sculpting tool to the virtual clay.
     func updateSculptingTool() {
+        // Process collision updates before the sculptingEntity guard
+        // so initial/scheduled regeneration works even without a connected stylus.
+        collisionManager.processUpdatesIfNeeded()
+        
+        // Process pending debris ejection forces (frame countdown).
+        boneDebrisManager.processPendingEjections()
+        
+        // Process debris growth animation.
+        boneDebrisManager.processGrowth()
+        
+        // If collision manager needs a blit, set the request on the component.
+        if collisionManager.blitRequested,
+           let stagingTexture = collisionManager.collisionStagingTexture {
+            collisionManager.blitRequested = false
+            let manager = collisionManager
+            sculptingTool.components[SculptingToolComponent.self]?.collisionBlitRequest = (
+                stagingTexture,
+                { @Sendable in manager.onBlitComplete() }
+            )
+        }
+        
         guard let sculptingEntity = sculptingEntity else {
             return
         }
@@ -153,16 +184,39 @@ final class SculptingToolModel {
         // This ensures it can carve into the correct part of virtual clay.
         sculptingTool.transform = Transform(matrix: simd_float4x4(matrix))
         
-        // Show the tracking state indicator if it's not position and orientation tracked.
-        updateTrackingStateIndicatorIfDirty(sculptingEntity: sculptingEntity)
+        // Offset sculpting position to match the drill ball tip
+        let drillBallLocalOffset = SIMD3<Float>(-0.005, 0.001, -0.04)
+        let rotatedOffset = sculptingTool.transform.rotation.act(drillBallLocalOffset)
+        sculptingTool.position += rotatedOffset
         
+        // Always sculpt when the device is present
+        sculptingTool.components[SculptingToolComponent.self]?.isActive = true
+        
+        // Log carving state using the SDF value sampled on the GPU.
+        // SDF <= 0 means the tool is at or inside the mesh surface.
+        if let sculptor = sculptingTool.components[SculptingToolComponent.self]?.sculptor {
+            let sdf = sculptor.lastSampledSDF
+            let isCarving = sdf <= 0
+            if isCarving != wasCarving {
+                print(isCarving ? "[Drill] Carving" : "[Drill] Idle")
+                if isCarving {
+                    triggerBoneDustBurst()
+                    boneDebrisManager.update(sculptingTool: sculptingTool)
+                }
+                wasCarving = isCarving
+            }
+            // Throttled collision update while carving.
+            if isCarving {
+                collisionManager.markDirty()
+            }
+        }
+        
+        /*
         // --- Bone debris update ---
         // Read the current active state from the sculpting tool component.
         let isActive = sculptingTool.components[SculptingToolComponent.self]?.isActive ?? false
-        boneDebrisManager.update(
-            toolPosition: sculptingTool.position,
-            isSculptingActive: isActive
-        )
+        boneDebrisManager.update(sculptingTool: sculptingTool)
+         */
     }
     
     // Add the attachment to the root entity.
@@ -172,6 +226,28 @@ final class SculptingToolModel {
         entity.components.set(CollisionComponent(shapes: [.generateBox(size: .init(repeating: 0.05))]))
         entity.name = name
         rootEntity?.addChild(entity)
+    }
+
+    // MARK: - Bone Dust Particles
+
+    /// Spawn a fresh BoneDust entity at the drill tip, let it play, then destroy it.
+    private func triggerBoneDustBurst() {
+        guard let root = rootEntity else { return }
+        let spawnPosition = sculptingTool.position
+
+        Task { @MainActor in
+            guard let dustEntity = try? await Entity(named: "BoneDust") else {
+                print("[BoneDust] Failed to load BoneDust.usdz")
+                return
+            }
+
+            dustEntity.position = spawnPosition
+            root.addChild(dustEntity)
+
+            // Let the particles play for a short duration, then remove
+            try? await Task.sleep(for: .milliseconds(1500))
+            dustEntity.removeFromParent()
+        }
     }
 
 }
