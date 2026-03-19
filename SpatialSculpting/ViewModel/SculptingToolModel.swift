@@ -54,6 +54,9 @@ final class SculptingToolModel {
     /// Manages collision generation for the sculpting volume via CPU marching cubes.
     let collisionManager = CollisionManager()
 
+    /// 64^3 metaball density grid for unified debris visualization.
+    let boneSlurryGrid: BoneSlurryGrid? = BoneSlurryGrid()
+
     // MARK: - Sculpt Material
 
     /// Attempt to load the SculptGraphMaterial from Reality Kit assets once.
@@ -237,13 +240,19 @@ final class SculptingToolModel {
         // Process collision updates before the sculptingEntity guard
         // so initial/scheduled regeneration works even without a connected stylus.
         collisionManager.processUpdatesIfNeeded()
-        
+
         // Process pending debris ejection forces (frame countdown).
         boneDebrisManager.processPendingEjections()
-        
+
         // Process debris growth animation.
         boneDebrisManager.processGrowth()
-        
+
+        // Process SDF adhesion forces on all debris.
+        boneDebrisManager.processAdhesion()
+
+        // Request periodic SDF blit for debris adhesion.
+        boneDebrisManager.requestSdfBlitIfNeeded()
+
         // If collision manager needs a blit, set the request on the component.
         if collisionManager.blitRequested,
            let stagingTexture = collisionManager.collisionStagingTexture {
@@ -254,7 +263,25 @@ final class SculptingToolModel {
                 { @Sendable in manager.onBlitComplete() }
             )
         }
-        
+
+        // If debris manager needs a blit, set the request on the component.
+        if boneDebrisManager.sdfBlitRequested,
+           let stagingTexture = boneDebrisManager.debrisStagingTexture {
+            boneDebrisManager.sdfBlitRequested = false
+            let manager = boneDebrisManager
+            sculptingTool.components[SculptingToolComponent.self]?.debrisBlitRequest = (
+                stagingTexture,
+                { @Sendable in manager.onSdfBlitComplete() }
+            )
+        }
+
+        // Upload debris particle data to bone slurry grid for metaball visualization.
+        if let root = rootEntity {
+            boneSlurryGrid?.uploadParticles(from: boneDebrisManager,
+                                            drillPosition: sculptingTool.position,
+                                            rootEntity: root)
+        }
+
         guard let sculptingEntity = sculptingEntity else {
             return
         }

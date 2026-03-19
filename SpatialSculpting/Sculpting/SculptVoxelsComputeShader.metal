@@ -1,5 +1,5 @@
 /*
-See the LICENSE.txt file for this sample’s licensing information.
+See the LICENSE.txt file for this sample's licensing information.
 
 Abstract:
 Compute shader operations for sculpting.
@@ -48,16 +48,16 @@ float resetShape(float3 position) {
 void reset(texture3d<float, access::write> voxels [[texture(0)]],
            constant VolumeParams &params [[buffer(1)]],
            uint3 voxelCoords [[thread_position_in_grid]]) {
-    
+
     // Skip out of bounds threads.
     if (any(voxelCoords >= params.dimensions)) { return; }
-    
+
     // Get the position of the current voxel in model space.
     float3 position = params.voxelStartPosition + float3(voxelCoords) * params.voxelSize;
-    
+
     // Get the distance of the current position to the reset shape.
     float distance = resetShape(position);
-    
+
     // Write the distance back to the voxel texture.
     voxels.write(distance, voxelCoords);
 }

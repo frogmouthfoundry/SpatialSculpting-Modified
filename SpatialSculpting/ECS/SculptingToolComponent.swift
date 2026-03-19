@@ -1,5 +1,5 @@
 /*
-See the LICENSE.txt file for this sample’s licensing information.
+See the LICENSE.txt file for this sample's licensing information.
 
 Abstract:
 A component that determines sculpting parameters.
@@ -47,18 +47,20 @@ struct SculptingToolComponent: Component {
     var loadFromTexture: MTLTexture? = nil
     var loadPayload: SculptLoadPayload? = nil
     var collisionBlitRequest: (MTLTexture, @Sendable () -> Void)? = nil
+    var debrisBlitRequest: (MTLTexture, @Sendable () -> Void)? = nil
+    var boneSlurryGrid: BoneSlurryGrid? = nil
 }
 
 // Update the sculpture depending on user-accessory interactions.
 struct SculptingToolSystem: ComputeSystem {
     let query = EntityQuery(where: .has(SculptingToolComponent.self))
-    
+
     func update(computeContext: inout ComputeUpdateContext) {
         for sculptingTool in computeContext.sceneUpdateContext.scene.performQuery(query) {
             guard var sculptingToolComponent = sculptingTool.components[SculptingToolComponent.self] else {
                 continue
             }
-            
+
             sculptingToolComponent.radius = simd_clamp(sculptingToolComponent.radius, 0.002, 0.5)
 
             // Reset the sculpture to a box.
@@ -122,6 +124,19 @@ struct SculptingToolSystem: ComputeSystem {
                 )
                 sculptingToolComponent.collisionBlitRequest = nil
             }
+
+            // Blit SDF for debris adhesion (CPU readback).
+            if let (destTexture, onCompletion) = sculptingToolComponent.debrisBlitRequest {
+                sculptingToolComponent.sculptor.blitForCollision(
+                    destinationTexture: destTexture,
+                    computeContext: &computeContext,
+                    onCompletion: onCompletion
+                )
+                sculptingToolComponent.debrisBlitRequest = nil
+            }
+
+            // BoneSlurry grid: dispatch clear → splat → march passes.
+            sculptingToolComponent.boneSlurryGrid?.update(computeContext: &computeContext)
 
             sculptingToolComponent.previousPosition = sculptingTool.isActive ? sculptingTool.position : nil
 

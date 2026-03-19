@@ -3,10 +3,15 @@ Abstract:
 Manages bone debris box volumes spawned when the sculpting tool contacts
 the sculpted volume. Reads position and state directly from
 SculptingToolComponent — no redundant position tracking.
+
+SDF-based adhesion: debris "sticks" to the bone surface using forces
+derived from the signed distance field gradient. Debris size is
+modulated by SDF distance at spawn position.
 */
 
 import RealityKit
 import UIKit
+import Metal
 import Combine
 import QuartzCore
 
@@ -16,7 +21,7 @@ final class BoneDebrisManager {
     // MARK: - Constants
 
     static let debrisRadius: Float = 0.001  // 1 mm
-    static let debrisStretch: Float = 2.5   // elongation along depth axis
+    static let debrisStretch: Float = 1.7   // elongation along depth axis
 
     private let stepDistance: Float = 0.002
     private let minimumMovement: Float = 0.0005
@@ -42,14 +47,62 @@ final class BoneDebrisManager {
     // MARK: - Growth Animation (tunable)
 
     /// Per-axis scale increment per growth tick. X,Y grow at 2× the Z rate.
-    var growthPerTick: SIMD3<Float> = SIMD3<Float>(0.10, 0.10, 0.05)
+    var growthPerTick: SIMD3<Float> = SIMD3<Float>(0.15, 0.15, 0.075)
     /// Seconds between each growth tick.
     var growthInterval: TimeInterval = 0.2
     /// Per-axis maximum scale multiplier relative to spawn size.
-    var growthMaxMultiplier: SIMD3<Float> = SIMD3<Float>(4.0, 4.0, 2.0)
+    var growthMaxMultiplier: SIMD3<Float> = SIMD3<Float>(6.0, 6.0, 3.0)
 
     /// Debris currently growing: (entity, base scale at spawn, current per-axis multiplier, last tick time).
     private var growingDebris: [(entity: ModelEntity, baseScale: SIMD3<Float>, multiplier: SIMD3<Float>, lastTick: TimeInterval)] = []
+
+    // MARK: - SDF Adhesion Constants
+
+    /// Stickiness factor: strength of the adhesion force pulling debris toward the surface.
+    var adhesionStickiness: Float = 0.003
+
+    /// Distance threshold (in model space) within which friction/stiction is applied.
+    /// Debris closer than this to the surface will be damped aggressively.
+    var adhesionFrictionThreshold: Float = 0.01
+
+    /// Velocity damping factor applied when debris is within friction threshold.
+    /// 0 = no damping, 1 = full stop. Applied per-frame as (1 - factor).
+    var adhesionFrictionDamping: Float = 0.85
+
+    /// Maximum SDF distance at which adhesion force is applied.
+    /// Beyond this, debris is in free-fall (gravity only).
+    var adhesionMaxDistance: Float = 0.04
+
+    /// Size modulation: debris spawned at SDF=0 gets this scale multiplier,
+    /// scaling down linearly as |SDF| increases toward adhesionMaxDistance.
+    var sdfSizeScaleMin: Float = 0.5
+    var sdfSizeScaleMax: Float = 1.5
+
+    /// Central difference step size for SDF gradient computation (in voxel coords).
+    private let gradientStep: Int = 1
+
+    // MARK: - SDF Data
+
+    /// Volume spatial parameters (set during setup if voxelVolume is provided).
+    private var hasSDF: Bool = false
+    private var sdfDimensions: SIMD3<UInt32> = .zero
+    private var sdfVoxelSize: SIMD3<Float> = .zero
+    private var sdfVoxelStartPosition: SIMD3<Float> = .zero
+
+    /// CPU-readable SDF data, refreshed periodically via blit from GPU.
+    private var sdfData: [Float] = []
+    /// Shared staging texture for CPU readback of SDF data.
+    private var sdfStagingTexture: MTLTexture?
+
+    /// Whether we're currently waiting for a blit to complete.
+    private var isBlitting: Bool = false
+
+    /// Set to true to request a blit from the compute system.
+    var sdfBlitRequested: Bool = false
+
+    /// Minimum interval between SDF blit requests.
+    private let sdfBlitInterval: TimeInterval = 0.3
+    private var lastSdfBlitTime: TimeInterval = 0
 
     // MARK: - State
 
@@ -80,7 +133,40 @@ final class BoneDebrisManager {
 
     // MARK: - Setup
 
+    /// Setup without SDF access (fallback — no adhesion).
     func setup(rootEntity: Entity) {
+        setupCommon(rootEntity: rootEntity)
+    }
+
+    /// Setup with SDF access from the voxel volume. Enables adhesion forces.
+    func setup(rootEntity: Entity, voxelVolume: VoxelVolume) {
+        setupCommon(rootEntity: rootEntity)
+
+        // Store volume spatial parameters for CPU SDF sampling.
+        self.hasSDF = true
+        self.sdfDimensions = voxelVolume.dimensions
+        self.sdfVoxelSize = voxelVolume.voxelSize
+        self.sdfVoxelStartPosition = voxelVolume.voxelStartPosition
+
+        // Create shared staging texture for CPU readback (same pattern as CollisionManager).
+        let desc = MTLTextureDescriptor()
+        desc.textureType = .type3D
+        desc.pixelFormat = .r32Float
+        desc.width = Int(sdfDimensions.x)
+        desc.height = Int(sdfDimensions.y)
+        desc.depth = Int(sdfDimensions.z)
+        desc.usage = []
+        desc.storageMode = .shared
+        self.sdfStagingTexture = metalDevice?.makeTexture(descriptor: desc)
+
+        // Pre-allocate SDF data array.
+        let totalVoxels = Int(sdfDimensions.x) * Int(sdfDimensions.y) * Int(sdfDimensions.z)
+        self.sdfData = [Float](repeating: Float.greatestFiniteMagnitude, count: totalVoxels)
+
+        print("[BoneDebrisManager] SDF adhesion enabled: \(sdfDimensions.x)×\(sdfDimensions.y)×\(sdfDimensions.z)")
+    }
+
+    private func setupCommon(rootEntity: Entity) {
         self.rootEntity = rootEntity
 
         var physicsSimulation = PhysicsSimulationComponent()
@@ -103,6 +189,102 @@ final class BoneDebrisManager {
             height: capsuleHeight + Self.debrisRadius * 2.0,
             radius: Self.debrisRadius
         )
+    }
+
+    // MARK: - SDF Blit Management
+
+    /// Returns the staging texture for the compute system to blit SDF data into.
+    var debrisStagingTexture: MTLTexture? { sdfStagingTexture }
+
+    /// Request an SDF blit if enough time has passed since the last one.
+    func requestSdfBlitIfNeeded() {
+        guard hasSDF, !isBlitting else { return }
+        let now = CACurrentMediaTime()
+        guard now - lastSdfBlitTime >= sdfBlitInterval else { return }
+        lastSdfBlitTime = now
+        isBlitting = true
+        sdfBlitRequested = true
+    }
+
+    /// Called by the compute system's completion handler after blit finishes.
+    nonisolated func onSdfBlitComplete() {
+        Task { @MainActor in
+            self.readSdfFromStagingTexture()
+            self.isBlitting = false
+        }
+    }
+
+    /// Read SDF float data from the shared staging texture into the CPU array.
+    private func readSdfFromStagingTexture() {
+        guard let texture = sdfStagingTexture else { return }
+        let w = Int(sdfDimensions.x)
+        let h = Int(sdfDimensions.y)
+        let d = Int(sdfDimensions.z)
+
+        sdfData.withUnsafeMutableBufferPointer { buf in
+            texture.getBytes(
+                buf.baseAddress!,
+                bytesPerRow: w * MemoryLayout<Float>.size,
+                bytesPerImage: w * h * MemoryLayout<Float>.size,
+                from: MTLRegion(origin: MTLOrigin(x: 0, y: 0, z: 0),
+                                size: MTLSize(width: w, height: h, depth: d)),
+                mipmapLevel: 0,
+                slice: 0
+            )
+        }
+    }
+
+    // MARK: - CPU SDF Sampling
+
+    /// Sample the SDF value at a world-space position. Returns a large positive value if out of bounds.
+    private func sampleSDF(at worldPosition: SIMD3<Float>) -> Float {
+        guard hasSDF, !sdfData.isEmpty else { return Float.greatestFiniteMagnitude }
+
+        let w = Int(sdfDimensions.x)
+        let h = Int(sdfDimensions.y)
+        let d = Int(sdfDimensions.z)
+
+        // Convert world position to voxel coordinates.
+        let voxelCoordF = (worldPosition - sdfVoxelStartPosition) / sdfVoxelSize
+        let x = Int(simd_clamp(voxelCoordF.x, 0, Float(w - 1)))
+        let y = Int(simd_clamp(voxelCoordF.y, 0, Float(h - 1)))
+        let z = Int(simd_clamp(voxelCoordF.z, 0, Float(d - 1)))
+
+        return sdfData[z * w * h + y * w + x]
+    }
+
+    /// Compute the SDF gradient (surface normal direction) at a world-space position
+    /// using central differences. Returns normalized gradient vector.
+    private func sdfGradient(at worldPosition: SIMD3<Float>) -> SIMD3<Float> {
+        guard hasSDF, !sdfData.isEmpty else { return SIMD3<Float>(0, 0, 1) }
+
+        let w = Int(sdfDimensions.x)
+        let h = Int(sdfDimensions.y)
+        let d = Int(sdfDimensions.z)
+        let step = gradientStep
+
+        // Convert world position to voxel coordinates.
+        let voxelCoordF = (worldPosition - sdfVoxelStartPosition) / sdfVoxelSize
+        let cx = Int(simd_clamp(voxelCoordF.x, 0, Float(w - 1)))
+        let cy = Int(simd_clamp(voxelCoordF.y, 0, Float(h - 1)))
+        let cz = Int(simd_clamp(voxelCoordF.z, 0, Float(d - 1)))
+
+        // Helper to read SDF with bounds clamping.
+        func readSDF(_ x: Int, _ y: Int, _ z: Int) -> Float {
+            let sx = max(0, min(w - 1, x))
+            let sy = max(0, min(h - 1, y))
+            let sz = max(0, min(d - 1, z))
+            return sdfData[sz * w * h + sy * w + sx]
+        }
+
+        // Central differences along each axis.
+        let dx = readSDF(cx + step, cy, cz) - readSDF(cx - step, cy, cz)
+        let dy = readSDF(cx, cy + step, cz) - readSDF(cx, cy - step, cz)
+        let dz = readSDF(cx, cy, cz + step) - readSDF(cx, cy, cz - step)
+
+        let gradient = SIMD3<Float>(dx, dy, dz)
+        let len = simd_length(gradient)
+        return len > 1e-6 ? gradient / len : SIMD3<Float>(0, 0, 1)
     }
 
     // MARK: - Per-Frame Update
@@ -163,8 +345,11 @@ final class BoneDebrisManager {
         boxEntity.name = "BoneDebris"
 
         let orientation = orientationAlongDirection(direction)
-        // Stretch sphere into ellipsoid along local Z (depth) axis.
-        let stretchScale = SIMD3<Float>(0.5, 1.0, 6.0)
+
+        // SDF-based size modulation: scale debris based on distance from surface.
+        let sdfSizeScale = computeSDFSizeScale(at: position)
+        let stretchScale = SIMD3<Float>(0.5, 0.8, 2.5) * sdfSizeScale
+
         boxEntity.transform = Transform(
             scale: stretchScale,
             rotation: orientation,
@@ -183,6 +368,9 @@ final class BoneDebrisManager {
             mode: .dynamic
         ))
 
+        // Semi-transparent debris so physics bodies are visible for debugging alongside metaball mesh.
+        boxEntity.components.set(OpacityComponent(opacity: 0.2))
+
         container.addChild(boxEntity)
         drawnEntities.append(boxEntity)
 
@@ -191,8 +379,20 @@ final class BoneDebrisManager {
         let ejectionDir = -direction
         pendingEjections.append((entity: boxEntity, direction: ejectionDir, framesLeft: ejectionDelayFrames))
 
-        // Queue for gradual growth from spawn scale to 200%.
+        // Queue for gradual growth from spawn scale to max.
         growingDebris.append((entity: boxEntity, baseScale: stretchScale, multiplier: SIMD3<Float>(1, 1, 1), lastTick: CACurrentMediaTime()))
+    }
+
+    /// Compute a size scale factor based on SDF distance at the spawn position.
+    /// Debris closer to the surface (SDF ≈ 0) gets a larger scale.
+    private func computeSDFSizeScale(at position: SIMD3<Float>) -> Float {
+        guard hasSDF, !sdfData.isEmpty else { return 1.0 }
+
+        let d = abs(sampleSDF(at: position))
+        // Normalize distance: 0 at surface, 1 at adhesionMaxDistance.
+        let t = simd_clamp(d / adhesionMaxDistance, 0, 1)
+        // Interpolate: closer to surface = larger size.
+        return simd_mix(sdfSizeScaleMax, sdfSizeScaleMin, t)
     }
 
     // MARK: - Ejection Force Processing
@@ -243,6 +443,50 @@ final class BoneDebrisManager {
         }
 
         growingDebris = stillGrowing
+    }
+
+    // MARK: - SDF Adhesion Processing
+
+    /// Call every frame to apply SDF-based adhesion forces and friction to all debris.
+    /// Debris near the bone surface is pulled toward it and damped; debris far away
+    /// falls freely under gravity.
+    func processAdhesion() {
+        guard hasSDF, !sdfData.isEmpty else { return }
+        guard isEnabled else { return }
+
+        for entity in drawnEntities {
+            guard let modelEntity = entity as? ModelEntity,
+                  modelEntity.parent != nil else { continue }
+
+            let position = modelEntity.position(relativeTo: debrisContainer)
+
+            // Sample SDF and compute gradient at debris position.
+            let sdfValue = sampleSDF(at: position)
+            let absDist = abs(sdfValue)
+
+            // Only apply adhesion within range.
+            guard absDist < adhesionMaxDistance else { continue }
+
+            let surfaceNormal = sdfGradient(at: position)
+
+            // Adhesion force: pull debris toward the surface.
+            // Force direction: opposite to gradient (toward decreasing SDF = toward surface).
+            // Strength scales with proximity: strongest at surface, fading at adhesionMaxDistance.
+            let proximityFactor = 1.0 - (absDist / adhesionMaxDistance)
+            let adhesionForce = -surfaceNormal * adhesionStickiness * proximityFactor
+            modelEntity.addForce(adhesionForce, relativeTo: nil)
+
+            // Friction/stiction: aggressively damp velocity when very close to surface.
+            if absDist < adhesionFrictionThreshold {
+                // Read current linear velocity and damp it.
+                if var physics = modelEntity.components[PhysicsMotionComponent.self] {
+                    physics.linearVelocity *= (1.0 - adhesionFrictionDamping)
+                    // Also damp angular velocity to prevent spinning on surface.
+                    physics.angularVelocity *= (1.0 - adhesionFrictionDamping * 0.5)
+                    modelEntity.components.set(physics)
+                }
+            }
+        }
     }
 
     private func orientationAlongDirection(_ direction: SIMD3<Float>) -> simd_quatf {

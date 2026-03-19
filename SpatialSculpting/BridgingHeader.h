@@ -11,3 +11,4 @@ Bridging header for sculpting implementation.
 #include "Mesh/MarchingCubesParams.h"
 #include "Sculpting/SculptParams.h"
 #include "Volume/VolumeParams.h"
+#include "BoneDebris/BoneSlurryParams.h"

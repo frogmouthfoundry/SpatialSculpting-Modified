@@ -1,5 +1,5 @@
 /*
-See the LICENSE.txt file for this sample’s licensing information.
+See the LICENSE.txt file for this sample's licensing information.
 
 Abstract:
 The volume for sculpting and UI for controls.
@@ -13,10 +13,10 @@ import CoreHaptics
 
 struct ContentView: View {
     var root: Entity = Entity(components: [ComputeSystemComponent(computeSystem: SculptingToolSystem())])
-    
+
     @State var sculpting: SculptingToolModel = SculptingToolModel()
     @State var haptics: HapticsModel = HapticsModel()
-    
+
     let marchingCubesMesh: MarchingCubesMesh!
     let sculptor: MarchingCubesMeshSculptor!
 
@@ -89,7 +89,7 @@ struct ContentView: View {
         self.marchingCubesMesh = try? MarchingCubesMesh(voxelVolume: voxelVolume)
         self.sculptor = MarchingCubesMeshSculptor(marchingCubesMesh: marchingCubesMesh)
     }
-    
+
     func createMeshChunkEntity(meshChunk: MarchingCubesMeshChunk) throws -> Entity {
         let mesh = try MeshResource(from: meshChunk.mesh)
         let meshChunkEntity = Entity()
@@ -98,7 +98,7 @@ struct ContentView: View {
         meshChunkEntity.name = "SculptMeshChunk"
         return meshChunkEntity
     }
-     
+
     func sculptingVolume() -> some View {
         RealityView { content, attachments in
             // Initialize visionOS bundled reality-material path (if bundled).
@@ -112,48 +112,59 @@ struct ContentView: View {
                     }
                 }
             }
-            
-            sculpting.sculptingTool.components.set(SculptingToolComponent(sculptor: sculptor))
-            
+
+            var toolComponent = SculptingToolComponent(sculptor: sculptor)
+            toolComponent.boneSlurryGrid = sculpting.boneSlurryGrid
+            sculpting.sculptingTool.components.set(toolComponent)
+
             root.addChild(sculpting.sculptingTool)
-            
+
+            // Add bone slurry mesh entity to root for rendering.
+            if let slurryEntity = sculpting.boneSlurryGrid?.entity {
+                root.addChild(slurryEntity)
+            }
+
             content.add(root)
             sculpting.rootEntity = root
-            
-            // Set up the bone debris manager with the root entity.
-            sculpting.boneDebrisManager.setup(rootEntity: root)
+
+            // Set up the bone debris manager with the root entity and SDF access.
+            if let voxelVolume = marchingCubesMesh?.voxelVolume {
+                sculpting.boneDebrisManager.setup(rootEntity: root, voxelVolume: voxelVolume)
+            } else {
+                sculpting.boneDebrisManager.setup(rootEntity: root)
+            }
 
             // Pre-load bone dust particle template to avoid disk I/O during sculpting.
             sculpting.preloadBoneDust()
-            
+
             // Set up the collision manager with direct SDF access.
             if let voxelVolume = marchingCubesMesh?.voxelVolume {
                 sculpting.collisionManager.setup(rootEntity: root, voxelVolume: voxelVolume)
             }
             // Schedule initial collision generation (delay for GPU to render first mesh).
             sculpting.collisionManager.scheduleRegeneration()
-            
+
             // Update sculpting tool and check for tracking quality each frame.
             _ = content.subscribe(to: SceneEvents.Update.self) {
                 _ in
                 sculpting.updateSculptingTool()
             }
-            
+
             if let additiveAttachment = attachments.entity(for: "Additive") {
                 sculpting.addEntityAttachmentToRoot(entity: additiveAttachment, name: "AdditiveIcon")
                 sculpting.additiveIcon = additiveAttachment
             }
-            
+
             if let subtractiveAttachment = attachments.entity(for: "Subtractive") {
                 sculpting.addEntityAttachmentToRoot(entity: subtractiveAttachment, name: "SubtractiveIcon")
                 sculpting.subtractiveIcon = subtractiveAttachment
             }
-            
+
             if let enlargeAttachment = attachments.entity(for: "Enlarge") {
                 sculpting.addEntityAttachmentToRoot(entity: enlargeAttachment, name: "EnlargeIcon")
                 sculpting.enlargeIcon = enlargeAttachment
             }
-            
+
             if let reduceAttachment = attachments.entity(for: "Reduce") {
                 sculpting.addEntityAttachmentToRoot(entity: reduceAttachment, name: "ReduceIcon")
                 sculpting.reduceIcon = reduceAttachment
@@ -166,15 +177,15 @@ struct ContentView: View {
             Attachment(id: "Additive") {
                 ToolbarElement(name: "Add")
             }
-            
+
             Attachment(id: "Subtractive") {
                 ToolbarElement(name: "Subtract")
             }
-            
+
             Attachment(id: "Enlarge") {
                 ToolbarElement(name: "Enlarge")
             }
-            
+
             Attachment(id: "Reduce") {
                 ToolbarElement(name: "Reduce")
             }
@@ -245,7 +256,7 @@ struct ContentView: View {
             Text("Clear")
         }
     }
-    
+
     func resetButton() -> some View {
         Button {
             sculpting.sculptingTool.components[SculptingToolComponent.self]?.reset = true
@@ -254,7 +265,7 @@ struct ContentView: View {
             Text("Reset")
         }
     }
-    
+
     func toggleDebrisDrawingButton() -> some View {
         Button {
             sculpting.boneDebrisManager.isEnabled.toggle()
@@ -262,7 +273,7 @@ struct ContentView: View {
             Text(sculpting.boneDebrisManager.isEnabled ? "Debris: ON" : "Debris: OFF")
         }
     }
-    
+
     func clearDebrisButton() -> some View {
         Button {
             sculpting.boneDebrisManager.clearAllDebris()
@@ -270,7 +281,7 @@ struct ContentView: View {
             Text("Clear Debris")
         }
     }
-    
+
     func toggleGravityButton() -> some View {
         Button {
             sculpting.boneDebrisManager.isGravityEnabled.toggle()
@@ -278,7 +289,7 @@ struct ContentView: View {
             Text(sculpting.boneDebrisManager.isGravityEnabled ? "Gravity: ON" : "Gravity: OFF")
         }
     }
-    
+
     func diagnoseButton() -> some View {
         Button {
             if let root = sculpting.rootEntity {
@@ -288,7 +299,7 @@ struct ContentView: View {
             Text("Diagnose")
         }
     }
-    
+
     func dropSphereButton() -> some View {
         Button {
             sculpting.collisionManager.dropTestSphere()
@@ -328,7 +339,7 @@ struct ContentView: View {
     //Final Consolidated View
     var body: some View {
         ZStack {
-            
+
             //Sculpt Volume
             sculptingVolume()
                 .ornament(attachmentAnchor: .scene(.bottomFront)) {
@@ -352,15 +363,15 @@ struct ContentView: View {
                     }.padding().glassBackgroundEffect()
                 }
             //end Sculpting Volume
-            
+
             /*
             //Additional 3D Content
             RealityView { content in
-                
+
                 guard let stageEntity = try? Entity.load(named: "Staging") else {
-                    print("❌ Failed to find Staging Entity")
+                    print("Failed to find Staging Entity")
                     return }
-                
+
                 stageEntity.scale *= 0.3
                 //stageEntity.transform.translation += SIMD3(0,0,0.1)
                 content.add(stageEntity)
