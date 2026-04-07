@@ -25,7 +25,55 @@ import RealityKit
 }
 
 extension SculptingToolModel {
-    
+
+    // MARK: - Drill Shaft Collision Visual Feedback
+
+    /// Walk the drill model entity tree and cache every ModelComponent's materials.
+    func cacheDrillMaterials() {
+        guard let drillModel = drillModelEntity else { return }
+        var cache: [(Entity, [any RealityKit.Material])] = []
+        func walk(_ entity: Entity) {
+            if let model = entity.components[ModelComponent.self] {
+                cache.append((entity, model.materials))
+            }
+            for child in entity.children {
+                walk(child)
+            }
+        }
+        walk(drillModel)
+        _cachedDrillMaterials = cache
+    }
+
+    /// Tint the entire drill model red to indicate shaft collision.
+    func tintDrillRed() {
+        guard !_isDrillTintedRed else { return }
+        _isDrillTintedRed = true
+        guard let drillModel = drillModelEntity else { return }
+        let redMaterial = SimpleMaterial(color: .red, roughness: 0.3, isMetallic: false)
+        func walk(_ entity: Entity) {
+            if var model = entity.components[ModelComponent.self] {
+                model.materials = Array(repeating: redMaterial, count: model.materials.count)
+                entity.components.set(model)
+            }
+            for child in entity.children {
+                walk(child)
+            }
+        }
+        walk(drillModel)
+    }
+
+    /// Restore original drill materials after shaft collision clears.
+    func restoreDrillMaterials() {
+        guard _isDrillTintedRed else { return }
+        _isDrillTintedRed = false
+        for (entity, materials) in _cachedDrillMaterials {
+            if var model = entity.components[ModelComponent.self] {
+                model.materials = materials
+                entity.components.set(model)
+            }
+        }
+    }
+
     // Add a visual tooltip to indicate where sculpting occurs.
     // Also add a tracking state indicator to indicate when tracking may be
     // failing due to reduced sensor coverage.
@@ -54,8 +102,9 @@ extension SculptingToolModel {
             drillModel.scale = SIMD3<Float>(repeating: scaleFactor)
         }
 
-        // Position so the tip of the model sits at the anchor origin.
-        // The drill model extends along +Z; shift it so the front (min Z) is at origin.
+        // Position so the tip of the model sits near the anchor origin.
+        // The drill model extends along +Z; shift it so the front (min Z)
+        // is 5 cm in front of the anchor.
         let scaledBounds = drillModel.visualBounds(relativeTo: nil)
         let center = scaledBounds.center
         let extents = scaledBounds.extents
@@ -68,13 +117,26 @@ extension SculptingToolModel {
         anchor.addChild(drillModel)
         drillModelEntity = drillModel
 
-        // Create spinning drill ball at the tip
+        // Cache original materials for shaft collision tint/restore.
+        cacheDrillMaterials()
+
+        // Compute the drill tip position in anchor-local space.
+        // The positioning math above places the model's min-Z face at Z = -0.05.
+        // In general: tipZ = drillModel.position.z + scaledBounds.min.z
+        let tipZ = drillModel.position.z + scaledBounds.min.z
+        // X/Y offset compensates for the drill overlay being slightly off the stylus axis.
+        let tipPosition = SIMD3<Float>(-0.005, 0.001, tipZ)
+
+        // Create spinning drill ball at the tip, centered on the shaft axis.
         let drillBall = DrillRotationComponent.createDrillBall(rpm: 400)
-        drillBall.position = SIMD3<Float>(-0.005, 0.001, -0.04)
+        drillBall.position = tipPosition
         anchor.addChild(drillBall)
         drillBallEntity = drillBall
 
-        print("Drill model and rotating ball attached to accessory")
+        // Store the tip offset so updateSculptingTool() can use it for sculpting position.
+        drillBallLocalOffset = tipPosition
+
+        print("Drill model and rotating ball attached at tip \(tipPosition)")
     }
     
     // Anchor via AnchorEntity to a GCDevice.

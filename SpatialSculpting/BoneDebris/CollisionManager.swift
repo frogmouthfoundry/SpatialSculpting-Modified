@@ -312,6 +312,58 @@ final class CollisionManager: @unchecked Sendable {
         }
     }
 
+    // MARK: - SDF Sampling (CPU)
+
+    /// Sample the SDF value at a world-space position using the shared staging texture.
+    /// Returns `nil` if the point is outside the volume bounds or the staging texture
+    /// hasn't been blitted yet.
+    func sampleSDF(at worldPosition: SIMD3<Float>) -> Float? {
+        guard let texture = stagingTexture, dimensions != .zero else { return nil }
+
+        // World → voxel coordinates (continuous).
+        let voxelCoord = (worldPosition - voxelStartPosition) / voxelSize
+
+        // Nearest integer voxel.
+        let ix = Int(voxelCoord.x.rounded(.toNearestOrEven))
+        let iy = Int(voxelCoord.y.rounded(.toNearestOrEven))
+        let iz = Int(voxelCoord.z.rounded(.toNearestOrEven))
+
+        let w = Int(dimensions.x)
+        let h = Int(dimensions.y)
+        let d = Int(dimensions.z)
+
+        guard ix >= 0, ix < w, iy >= 0, iy < h, iz >= 0, iz < d else {
+            return nil // outside volume
+        }
+
+        // Read a single float from the shared staging texture.
+        var value: Float = 0
+        let region = MTLRegion(origin: MTLOrigin(x: ix, y: iy, z: iz),
+                               size: MTLSize(width: 1, height: 1, depth: 1))
+        texture.getBytes(&value,
+                         bytesPerRow: MemoryLayout<Float>.size,
+                         bytesPerImage: MemoryLayout<Float>.size,
+                         from: region,
+                         mipmapLevel: 0,
+                         slice: 0)
+        return value
+    }
+
+    /// Compute the SDF gradient (≈ outward surface normal) at a world-space
+    /// position using central finite differences on the staging texture.
+    func sampleSDFGradient(at worldPosition: SIMD3<Float>) -> SIMD3<Float> {
+        let h = voxelSize // step one voxel in each axis
+
+        let xp = sampleSDF(at: worldPosition + SIMD3<Float>(h.x, 0, 0)) ?? 1.0
+        let xn = sampleSDF(at: worldPosition - SIMD3<Float>(h.x, 0, 0)) ?? 1.0
+        let yp = sampleSDF(at: worldPosition + SIMD3<Float>(0, h.y, 0)) ?? 1.0
+        let yn = sampleSDF(at: worldPosition - SIMD3<Float>(0, h.y, 0)) ?? 1.0
+        let zp = sampleSDF(at: worldPosition + SIMD3<Float>(0, 0, h.z)) ?? 1.0
+        let zn = sampleSDF(at: worldPosition - SIMD3<Float>(0, 0, h.z)) ?? 1.0
+
+        return SIMD3<Float>(xp - xn, yp - yn, zp - zn) / (2.0 * h)
+    }
+
     // MARK: - Test Sphere
 
     func dropTestSphere() {

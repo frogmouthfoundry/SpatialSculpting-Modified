@@ -29,6 +29,9 @@ final class MarchingCubesMesh {
     //
     // See `MarchingCubesCompute.metal`.
     private let clearPipeline: MTLComputePipelineState = makeComputePipeline(named: "clear")!
+    // Compute pipeline that resets the atomic triangle counter entirely on the GPU,
+    // avoiding a CPU–GPU data race from the previous storeBytes approach.
+    private let clearCounterPipeline: MTLComputePipelineState = makeComputePipeline(named: "clearCounter")!
     
     let voxelVolume: VoxelVolume
     var meshChunks: [MarchingCubesMeshChunk] = []
@@ -158,6 +161,15 @@ final class MarchingCubesMesh {
             computeEncoder.setBytes(&meshChunk.params, length: MemoryLayout<MarchingCubesParams>.size, index: 2)
             computeEncoder.dispatchThreadgroups(meshChunk.clearThreadgroups, threadsPerThreadgroup: meshChunk.clearThreadsPerThreadgroup)
 
+            // Reset the atomic triangle counter on the GPU (avoids CPU–GPU race).
+            computeEncoder.setComputePipelineState(clearCounterPipeline)
+            computeEncoder.setBuffer(counterBuffer, offset: 0, index: 0)
+            computeEncoder.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                                threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+
+            // Memory barrier: ensure clear writes are visible before march reads.
+            computeEncoder.memoryBarrier(scope: .buffers)
+
             // Run marching cubes (reuse the same buffer references).
             computeEncoder.setComputePipelineState(marchPipeline)
             computeEncoder.setBuffer(vertexBuffer, offset: 0, index: 0)
@@ -165,7 +177,6 @@ final class MarchingCubesMesh {
             computeEncoder.setTexture(voxelVolume.voxelTexture, index: 2)
             computeEncoder.setBytes(&meshChunk.params, length: MemoryLayout<MarchingCubesParams>.size, index: 3)
             computeEncoder.setBuffer(triangleTableBuffer, offset: 0, index: 4)
-            counterBuffer.contents().storeBytes(of: 0, as: UInt32.self)
             computeEncoder.setBuffer(counterBuffer, offset: 0, index: 5)
             computeEncoder.setBytes(&isoValue, length: MemoryLayout<Float>.size, index: 6)
             // Feed material volumes into march for per-vertex shading data.

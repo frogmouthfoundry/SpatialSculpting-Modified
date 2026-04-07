@@ -42,6 +42,17 @@ final class SculptingToolModel {
     var drillModelEntity: Entity? = nil
     var drillBallEntity: ModelEntity? = nil
 
+    /// Anchor-local offset from the accessory origin to the drill ball center.
+    /// Computed dynamically from the USDZ model bounds in `attachDrillModel`.
+    var drillBallLocalOffset = SIMD3<Float>(0, 0, -0.04)
+
+    // Shaft collision detection
+    let shaftCollisionDetector = ShaftCollisionDetector()
+    /// Cached original materials for the drill model (populated after attach).
+    var _cachedDrillMaterials: [(Entity, [any RealityKit.Material])] = []
+    /// Whether the drill is currently tinted red due to shaft collision.
+    var _isDrillTintedRed: Bool = false
+
     // Tracks carving state for logging and particle bursts
     private var wasCarving: Bool = false
 
@@ -292,11 +303,34 @@ final class SculptingToolModel {
         // This ensures it can carve into the correct part of virtual clay.
         sculptingTool.transform = Transform(matrix: simd_float4x4(matrix))
         
-        // Offset sculpting position to match the drill ball tip
-        let drillBallLocalOffset = SIMD3<Float>(-0.005, 0.001, -0.04)
+        // Offset sculpting position to match the drill ball tip (centered on shaft axis).
+        // drillBallLocalOffset is computed from the USDZ bounds in attachDrillModel().
         let rotatedOffset = sculptingTool.transform.rotation.act(drillBallLocalOffset)
         sculptingTool.position += rotatedOffset
-        
+
+        // --- Shaft collision detection ---
+        // The shaft extends from the tip backward along the drill's local +Z axis
+        // (the USDZ model body goes in +Z from the tip).
+        let shaftDirection = sculptingTool.transform.rotation.act(SIMD3<Float>(0, 0, 1))
+        let shaftResult = shaftCollisionDetector.test(
+            tipPosition: sculptingTool.position,
+            shaftDirection: simd_normalize(shaftDirection),
+            collisionManager: collisionManager
+        )
+
+        if shaftResult.isColliding {
+            // Physical blocking: push the tool out of the volume.
+            sculptingTool.position += shaftResult.correctionVector
+            // Visual feedback: tint drill red.
+            tintDrillRed()
+            // Haptic feedback: sharp warning pulse.
+            hapticsModel?.startShaftCollisionFeedback()
+        } else {
+            // Clear visual and haptic warnings.
+            restoreDrillMaterials()
+            hapticsModel?.stopShaftCollisionFeedback()
+        }
+
         // Always sculpt when the device is present
         sculptingTool.components[SculptingToolComponent.self]?.isActive = true
         

@@ -35,11 +35,42 @@ extension HapticsModel {
             ], parameterCurves: [])
         }
 
+        // Shaft collision warning: rapid sharp pulses — distinct "danger" feel
+        if shaftCollisionPattern == nil {
+            shaftCollisionPattern = try? CHHapticPattern(events: [
+                // Four rapid transient taps over 0.3s, looped via long duration
+                CHHapticEvent(eventType: .hapticTransient, parameters: [
+                    CHHapticEventParameter(parameterID: .hapticIntensity, value: 0.8),
+                    CHHapticEventParameter(parameterID: .hapticSharpness, value: 0.95)
+                ], relativeTime: 0.0),
+                CHHapticEvent(eventType: .hapticTransient, parameters: [
+                    CHHapticEventParameter(parameterID: .hapticIntensity, value: 0.6),
+                    CHHapticEventParameter(parameterID: .hapticSharpness, value: 0.9)
+                ], relativeTime: 0.08),
+                CHHapticEvent(eventType: .hapticTransient, parameters: [
+                    CHHapticEventParameter(parameterID: .hapticIntensity, value: 0.8),
+                    CHHapticEventParameter(parameterID: .hapticSharpness, value: 0.95)
+                ], relativeTime: 0.16),
+                CHHapticEvent(eventType: .hapticTransient, parameters: [
+                    CHHapticEventParameter(parameterID: .hapticIntensity, value: 0.6),
+                    CHHapticEventParameter(parameterID: .hapticSharpness, value: 0.9)
+                ], relativeTime: 0.24),
+                // Sustained buzz between pulses for continuous warning feel
+                CHHapticEvent(eventType: .hapticContinuous, parameters: [
+                    CHHapticEventParameter(parameterID: .hapticIntensity, value: 0.35),
+                    CHHapticEventParameter(parameterID: .hapticSharpness, value: 0.7)
+                ], relativeTime: 0.0, duration: 0.3)
+            ], parameterCurves: [])
+        }
+
         if let idlePattern = idlePattern {
             idlePlayer = try? hapticEngine?.makePlayer(with: idlePattern)
         }
         if let sculptPattern = sculptPattern {
             sculptPlayer = try? hapticEngine?.makePlayer(with: sculptPattern)
+        }
+        if let shaftCollisionPattern = shaftCollisionPattern {
+            shaftCollisionPlayer = try? hapticEngine?.makePlayer(with: shaftCollisionPattern)
         }
     }
 
@@ -77,6 +108,31 @@ extension HapticsModel {
         isSculptPlaying = false
         // Resume idle hum
         if isIdlePlaying {
+            try? idlePlayer?.start(atTime: CHHapticTimeImmediate)
+        }
+    }
+
+    /// Start the shaft collision warning pulse. Pauses sculpt/idle while active.
+    @MainActor
+    func startShaftCollisionFeedback() {
+        guard !isShaftCollisionPlaying else { return }
+        // Pause other patterns for clarity
+        try? idlePlayer?.stop(atTime: CHHapticTimeImmediate)
+        try? sculptPlayer?.stop(atTime: CHHapticTimeImmediate)
+        try? shaftCollisionPlayer?.start(atTime: CHHapticTimeImmediate)
+        isShaftCollisionPlaying = true
+    }
+
+    /// Stop the shaft collision warning pulse and resume previous state.
+    @MainActor
+    func stopShaftCollisionFeedback() {
+        guard isShaftCollisionPlaying else { return }
+        try? shaftCollisionPlayer?.stop(atTime: CHHapticTimeImmediate)
+        isShaftCollisionPlaying = false
+        // Resume sculpt or idle as appropriate
+        if isSculptPlaying {
+            try? sculptPlayer?.start(atTime: CHHapticTimeImmediate)
+        } else if isIdlePlaying {
             try? idlePlayer?.start(atTime: CHHapticTimeImmediate)
         }
     }

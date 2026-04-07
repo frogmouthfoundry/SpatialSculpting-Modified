@@ -22,4 +22,9 @@ final class HapticsModel {
     var sculptPattern: CHHapticPattern? = nil
     var sculptPlayer: CHHapticPatternPlayer? = nil
     var isSculptPlaying: Bool = false
+
+    // Shaft collision warning pulse
+    var shaftCollisionPattern: CHHapticPattern? = nil
+    var shaftCollisionPlayer: CHHapticPatternPlayer? = nil
+    var isShaftCollisionPlaying: Bool = false
 }

@@ -186,6 +186,14 @@ void march(device MeshVertex *vertices [[buffer(0)]],
     }
 }
 
+/// Resets the atomic triangle counter on the GPU, eliminating the CPU–GPU
+/// race that occurred when the counter was zeroed via storeBytes on the CPU
+/// while the GPU might still be reading/incrementing it.
+[[kernel]]
+void clearCounter(device atomic_uint &counter [[buffer(0)]]) {
+    atomic_store_explicit(&counter, 0, memory_order_relaxed);
+}
+
 [[kernel]]
 void clear(device MeshVertex *vertices [[buffer(0)]],
            device uint *indices [[buffer(1)]],
