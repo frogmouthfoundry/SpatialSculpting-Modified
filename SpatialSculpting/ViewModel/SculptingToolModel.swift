@@ -261,6 +261,12 @@ final class SculptingToolModel {
         // Process SDF adhesion forces on all debris.
         boneDebrisManager.processAdhesion()
 
+        // Process settling state machine: ejecting → settling → settled.
+        boneDebrisManager.processSettling()
+
+        // Process tool displacement: push settled slurry when burr passes nearby.
+        boneDebrisManager.processToolDisplacement(toolPosition: sculptingTool.position)
+
         // Request periodic SDF blit for debris adhesion.
         boneDebrisManager.requestSdfBlitIfNeeded()
 
@@ -287,9 +293,10 @@ final class SculptingToolModel {
         }
 
         // Upload debris particle data to bone slurry grid for metaball visualization.
+        // Also cull debris that has left the volume bounds.
+        boneDebrisManager.cullOutOfBoundsDebris()
         if let root = rootEntity {
             boneSlurryGrid?.uploadParticles(from: boneDebrisManager,
-                                            drillPosition: sculptingTool.position,
                                             rootEntity: root)
         }
 
@@ -304,9 +311,18 @@ final class SculptingToolModel {
         sculptingTool.transform = Transform(matrix: simd_float4x4(matrix))
         
         // Offset sculpting position to match the drill ball tip (centered on shaft axis).
-        // drillBallLocalOffset is computed from the USDZ bounds in attachDrillModel().
+        // drillBallLocalOffset is computed from the USDZ bounds in attachDrillModel()
+        // and lives in anchor-local space. sculptingTool.position is in root-local space
+        // (already divided by root.scale via transform(from:)). We must also divide the
+        // offset by root.scale so it matches the root-local coordinate system.
         let rotatedOffset = sculptingTool.transform.rotation.act(drillBallLocalOffset)
-        sculptingTool.position += rotatedOffset
+        let rootScale = rootEntity.transform.scale
+        let safeScale = SIMD3<Float>(
+            abs(rootScale.x) > 1e-6 ? rootScale.x : 1.0,
+            abs(rootScale.y) > 1e-6 ? rootScale.y : 1.0,
+            abs(rootScale.z) > 1e-6 ? rootScale.z : 1.0
+        )
+        sculptingTool.position += rotatedOffset / safeScale
 
         // --- Shaft collision detection ---
         // The shaft extends from the tip backward along the drill's local +Z axis

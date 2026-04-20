@@ -29,7 +29,13 @@ final class ShaftCollisionDetector {
 
     // MARK: - Configuration
 
-    /// How far behind the tip to check (meters).
+    /// Distance from the drill tip before shaft sampling begins (meters).
+    /// Leaves a "cutting zone" gap immediately around the burr so legitimate
+    /// tip contact doesn't trigger the shaft-collision alert. Increasing this
+    /// value moves both the collision detection AND the red-tint / haptic
+    /// warning further up the shaft (away from the tip).
+    private let shaftStartOffset: Float = 0.005 // 0.5 cm
+    /// How far past the start offset the shaft is sampled (meters).
     private let shaftLength: Float = 0.08       // 8 cm
     /// Number of evenly-spaced sample points along the shaft.
     private let sampleCount: Int = 10
@@ -58,7 +64,9 @@ final class ShaftCollisionDetector {
         let step = shaftLength / Float(sampleCount - 1)
 
         for i in 0..<sampleCount {
-            let t = Float(i) * step
+            // Start sampling shaftStartOffset behind the tip so the cutting
+            // burr zone does not trigger the shaft-collision alert.
+            let t = shaftStartOffset + Float(i) * step
             let worldPos = tipPosition + shaftDirection * t
 
             guard let sdfValue = collisionManager.sampleSDF(at: worldPos) else {

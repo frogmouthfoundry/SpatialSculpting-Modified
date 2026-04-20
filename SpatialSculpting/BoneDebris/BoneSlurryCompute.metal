@@ -87,15 +87,14 @@ void boneSlurryClearMesh(device BoneSlurryVertex *vertices [[buffer(0)]],
 // MARK: - Splat Kernel (Anisotropic Ellipsoidal)
 // ─────────────────────────────────────────────────────────────────────
 
-// Minimum influence radius in voxels. Ensures sub-voxel particles still
-// produce density on at least a few voxel centers (need ≥1.5 for marching
-// cubes to find a boundary). Set low to keep metaballs true-to-size.
-constant float MIN_SPLAT_RADIUS_VOXELS = 1.5;
+// Minimum influence radius in voxels — floor for spawn-size particles.
+// 2.5 voxels with isoValue 0.75 gives ~0.9 voxel visual radius (small
+// and round). Neighbouring particles overlap to merge smoothly.
+constant float MIN_SPLAT_RADIUS_VOXELS = 2.5;
 
-// Visual scale multiplier — controls how much the metaball radius exceeds
-// the physics body. Higher values make overlapping metaballs merge more,
-// giving a "melted" liquid look. 2.0 = twice the debris sphere radius.
-constant float VISUAL_SCALE_MULTIPLIER = 2.0;
+// Visual scale multiplier. At max growth (scale 3×), particles cover
+// ~13.5 voxels → visual radius ~5 voxels. Growth from 0.9 → 5 = 5.5×.
+constant float VISUAL_SCALE_MULTIPLIER = 30.0;
 
 [[kernel]]
 void boneSlurrySplat(device atomic_uint *density [[buffer(0)]],
@@ -113,9 +112,10 @@ void boneSlurrySplat(device atomic_uint *density [[buffer(0)]],
     if (any(localPos < float3(-5.0)) || any(localPos > float3(params.dimensions) + 5.0)) return;
 
     // Compute half-extents in voxel space.
-    // Base debris radius is 0.001m (1mm). Scale includes stretch + growth.
-    // VISUAL_SCALE_MULTIPLIER inflates the metaball well beyond the physics body.
-    float baseRadius = 0.001;
+    // Base debris radius is 0.00015m (0.15mm) — matches BoneDebrisManager.debrisRadius.
+    // Scale includes stretch + growth. VISUAL_SCALE_MULTIPLIER inflates the
+    // metaball well beyond the physics body.
+    float baseRadius = 0.00015;  // matches BoneDebrisManager.debrisRadius
     float3 worldHalfExtent = p.scale * baseRadius * VISUAL_SCALE_MULTIPLIER;
     float3 halfExtent = worldHalfExtent / params.voxelSize;
 

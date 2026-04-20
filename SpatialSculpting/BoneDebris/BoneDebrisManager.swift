@@ -20,22 +20,24 @@ final class BoneDebrisManager {
 
     // MARK: - Constants
 
-    static let debrisRadius: Float = 0.001  // 1 mm
-    static let debrisStretch: Float = 1.7   // elongation along depth axis
+    static let debrisRadius: Float = 0.00015  // 0.15 mm
+    static let debrisStretch: Float = 1.5   // elongation along depth axis
 
-    private let stepDistance: Float = 0.002
-    private let minimumMovement: Float = 0.0005
+    // Spawn rate ×2.5: smaller stepDistance + minimumMovement means more
+    // debris particles are created per unit of drill travel.
+    private let stepDistance: Float = 0.0016   // 50% lower spawn rate
+    private let minimumMovement: Float = 0.0004
 
     static let debrisGravity: SIMD3<Float> = SIMD3<Float>(-0.5, 0, -4.5)
 
     /// Maximum number of debris entities allowed at once.
     /// Oldest debris are removed when this limit is exceeded.
-    private let maxDebrisCount: Int = 150
+    private let maxDebrisCount: Int = 400
 
     // MARK: - Ejection Force (tunable per-axis)
 
     /// Base ejection force magnitude applied opposite to sculpting direction.
-    var ejectionForceBase: Float = 0.0005
+    var ejectionForceBase: Float = 0.005  // outward ejection away from bone
     /// Per-axis multipliers for ejection force. Z is 3x to push debris outward.
     var ejectionForceMultiplier: SIMD3<Float> = SIMD3<Float>(1.0, 1.0, 6.0)
     /// Frames to wait before applying the ejection impulse.
@@ -46,12 +48,12 @@ final class BoneDebrisManager {
 
     // MARK: - Growth Animation (tunable)
 
-    /// Per-axis scale increment per growth tick. X,Y grow at 2× the Z rate.
-    var growthPerTick: SIMD3<Float> = SIMD3<Float>(0.15, 0.15, 0.075)
+    /// Per-axis scale increment per growth tick. Slower growth for paste-like buildup.
+    var growthPerTick: SIMD3<Float> = SIMD3<Float>(0.025, 0.025, 0.0125)  // reaches max in ~4s
     /// Seconds between each growth tick.
-    var growthInterval: TimeInterval = 0.2
-    /// Per-axis maximum scale multiplier relative to spawn size.
-    var growthMaxMultiplier: SIMD3<Float> = SIMD3<Float>(6.0, 6.0, 3.0)
+    var growthInterval: TimeInterval = 0.05
+    /// Per-axis maximum scale multiplier relative to spawn size. Capped lower for realistic scale.
+    var growthMaxMultiplier: SIMD3<Float> = SIMD3<Float>(3.0, 3.0, 2.0)
 
     /// Debris currently growing: (entity, base scale at spawn, current per-axis multiplier, last tick time).
     private var growingDebris: [(entity: ModelEntity, baseScale: SIMD3<Float>, multiplier: SIMD3<Float>, lastTick: TimeInterval)] = []
@@ -59,7 +61,7 @@ final class BoneDebrisManager {
     // MARK: - SDF Adhesion Constants
 
     /// Stickiness factor: strength of the adhesion force pulling debris toward the surface.
-    var adhesionStickiness: Float = 0.003
+    var adhesionStickiness: Float = 0.01
 
     /// Distance threshold (in model space) within which friction/stiction is applied.
     /// Debris closer than this to the surface will be damped aggressively.
@@ -67,7 +69,7 @@ final class BoneDebrisManager {
 
     /// Velocity damping factor applied when debris is within friction threshold.
     /// 0 = no damping, 1 = full stop. Applied per-frame as (1 - factor).
-    var adhesionFrictionDamping: Float = 0.85
+    var adhesionFrictionDamping: Float = 0.65
 
     /// Maximum SDF distance at which adhesion force is applied.
     /// Beyond this, debris is in free-fall (gravity only).
@@ -80,6 +82,11 @@ final class BoneDebrisManager {
 
     /// Central difference step size for SDF gradient computation (in voxel coords).
     private let gradientStep: Int = 1
+
+    // MARK: - Volume Bounds (for debris culling)
+
+    private var volumeBoundsMin: SIMD3<Float> = SIMD3<Float>(repeating: -Float.greatestFiniteMagnitude)
+    private var volumeBoundsMax: SIMD3<Float> = SIMD3<Float>(repeating: Float.greatestFiniteMagnitude)
 
     // MARK: - SDF Data
 
@@ -103,6 +110,47 @@ final class BoneDebrisManager {
     /// Minimum interval between SDF blit requests.
     private let sdfBlitInterval: TimeInterval = 0.3
     private var lastSdfBlitTime: TimeInterval = 0
+
+    // MARK: - Settling State Machine (Option C)
+
+    /// Debris lifecycle: ejecting → settling → settled.
+    /// Settled debris has its physics body frozen (kinematic) and is only
+    /// moved by tool displacement (Option B).
+    enum DebrisState {
+        case ejecting    // just spawned, physics active, waiting for ejection impulse
+        case settling    // velocity below threshold, counting frames to confirm
+        case settled     // frozen in place, only displaced by tool
+    }
+
+    /// Per-entity state tracking for the settling system.
+    private var debrisStates: [ObjectIdentifier: DebrisState] = [:]
+
+    // MARK: - Growth / Visibility Data (readable by BoneSlurryGrid)
+
+    /// Current visual growth multiplier per entity. Applied in uploadParticles
+    /// instead of on the entity transform (which physics overwrites each frame).
+    private(set) var growthMultipliers: [ObjectIdentifier: SIMD3<Float>] = [:]
+
+    /// Spawn time per entity. Debris younger than `spawnVisibilityDelay` is
+    /// excluded from the metaball grid so it appears invisible initially.
+    private(set) var spawnTimes: [ObjectIdentifier: TimeInterval] = [:]
+
+    /// Seconds after spawn before debris becomes visible in the metaball mesh.
+    let spawnVisibilityDelay: TimeInterval = 0.15
+
+    /// Velocity magnitude below which debris begins the settling countdown.
+    private let settlingVelocityThreshold: Float = 0.005
+    /// Number of consecutive frames below threshold to confirm settled.
+    private let settlingFrameCount: Int = 10
+    /// Per-entity frame counter for settling confirmation.
+    private var settlingCounters: [ObjectIdentifier: Int] = [:]
+
+    // MARK: - Tool Displacement (Option B)
+
+    /// Radius around the tool tip within which settled debris is pushed outward.
+    var toolDisplacementRadius: Float = 0.008  // 8 mm
+    /// Force magnitude for displacing settled slurry.
+    var toolDisplacementForce: Float = 0.0003
 
     // MARK: - State
 
@@ -142,6 +190,11 @@ final class BoneDebrisManager {
     func setup(rootEntity: Entity, voxelVolume: VoxelVolume) {
         setupCommon(rootEntity: rootEntity)
 
+        // Store volume bounds for debris culling.
+        let dims = SIMD3<Float>(voxelVolume.dimensions)
+        self.volumeBoundsMin = voxelVolume.voxelStartPosition - voxelVolume.voxelSize * 0.5
+        self.volumeBoundsMax = voxelVolume.voxelStartPosition + voxelVolume.voxelSize * (dims - 0.5)
+
         // Store volume spatial parameters for CPU SDF sampling.
         self.hasSDF = true
         self.sdfDimensions = voxelVolume.dimensions
@@ -180,8 +233,14 @@ final class BoneDebrisManager {
 
         debrisMesh = .generateSphere(radius: Self.debrisRadius)
 
-        debrisMaterial = BoneDebrisMaterialLoader.loadDebrisMaterial()
-        physicsMaterial = BoneDebrisMaterialLoader.loadDebrisPhysicsMaterial()
+        var pbrMaterial = PhysicallyBasedMaterial()
+        pbrMaterial.baseColor = .init(tint: UIColor(red: 0xE3/255.0, green: 0xDA/255.0, blue: 0xC9/255.0, alpha: 1.0))
+        pbrMaterial.roughness = .init(floatLiteral: 0.7)
+        pbrMaterial.metallic = .init(floatLiteral: 0.0)
+        debrisMaterial = pbrMaterial
+        physicsMaterial = try? PhysicsMaterialResource.generate(
+            staticFriction: 0.5, dynamicFriction: 0.4, restitution: 0.1
+        )
 
         // Create the capsule shape once and cache it.
         let capsuleHeight = Self.debrisRadius * 2.0 * (Self.debrisStretch - 1.0)
@@ -334,6 +393,11 @@ final class BoneDebrisManager {
         // Enforce debris count limit — remove oldest first.
         while drawnEntities.count >= maxDebrisCount {
             let oldest = drawnEntities.removeFirst()
+            let oldId = ObjectIdentifier(oldest)
+            debrisStates.removeValue(forKey: oldId)
+            settlingCounters.removeValue(forKey: oldId)
+            growthMultipliers.removeValue(forKey: oldId)
+            spawnTimes.removeValue(forKey: oldId)
             oldest.removeFromParent()
         }
 
@@ -346,9 +410,10 @@ final class BoneDebrisManager {
 
         let orientation = orientationAlongDirection(direction)
 
-        // SDF-based size modulation: scale debris based on distance from surface.
+        // Initial scale = unit (mesh is already at debrisRadius).
+        // debrisStretch elongates along Z. SDF modulates overall size.
         let sdfSizeScale = computeSDFSizeScale(at: position)
-        let stretchScale = SIMD3<Float>(0.5, 0.8, 2.5) * sdfSizeScale
+        let stretchScale = SIMD3<Float>(1.0, 1.0, Self.debrisStretch) * sdfSizeScale
 
         boxEntity.transform = Transform(
             scale: stretchScale,
@@ -368,15 +433,22 @@ final class BoneDebrisManager {
             mode: .dynamic
         ))
 
-        // Semi-transparent debris so physics bodies are visible for debugging alongside metaball mesh.
-        boxEntity.components.set(OpacityComponent(opacity: 0.2))
+        // Hide physics entities — the metaball mesh is the visual representation.
+        boxEntity.components.set(OpacityComponent(opacity: 0.0))
 
         container.addChild(boxEntity)
         drawnEntities.append(boxEntity)
 
-        // Queue ejection force: will fire after ejectionDelayFrames.
-        // Direction is opposite to sculpting direction.
-        let ejectionDir = -direction
+        // Initialize settling state, growth multiplier, and spawn time.
+        let entityId = ObjectIdentifier(boxEntity)
+        debrisStates[entityId] = .ejecting
+        growthMultipliers[entityId] = stretchScale  // initial visual scale
+        spawnTimes[entityId] = CACurrentMediaTime()
+
+        // Queue ejection force: combine outward-from-surface (radial from volume
+        // center) with opposite-drill-direction so debris flies toward the user.
+        // SDF gradient is unreliable at freshly carved surfaces due to blit lag.
+        let ejectionDir = simd_normalize(outward - direction)
         pendingEjections.append((entity: boxEntity, direction: ejectionDir, framesLeft: ejectionDelayFrames))
 
         // Queue for gradual growth from spawn scale to max.
@@ -418,28 +490,41 @@ final class BoneDebrisManager {
     // MARK: - Growth Processing
 
     /// Call every frame to gradually scale up debris over time.
+    /// Growth multipliers are stored in `growthMultipliers` dictionary and
+    /// applied in uploadParticles — NOT on the entity transform, because
+    /// RealityKit physics overwrites dynamic entity transforms each frame.
+    private var growthLogCounter: Int = 0
+
     func processGrowth() {
         let now = CACurrentMediaTime()
         var stillGrowing: [(entity: ModelEntity, baseScale: SIMD3<Float>, multiplier: SIMD3<Float>, lastTick: TimeInterval)] = []
 
         for var entry in growingDebris {
-            guard entry.entity.parent != nil else { continue } // removed debris
+            guard entry.entity.parent != nil else { continue }
+            let id = ObjectIdentifier(entry.entity)
 
             let elapsed = now - entry.lastTick
             if elapsed >= growthInterval {
-                // Grow each axis independently, clamped to its max.
                 entry.multiplier = simd_min(entry.multiplier + growthPerTick, growthMaxMultiplier)
                 entry.lastTick = now
-                entry.entity.scale = entry.baseScale * entry.multiplier
             }
 
-            // Keep tracking until all axes have reached their max.
+            growthMultipliers[id] = entry.baseScale * entry.multiplier
+
             let reachedMax = entry.multiplier.x >= growthMaxMultiplier.x
                           && entry.multiplier.y >= growthMaxMultiplier.y
                           && entry.multiplier.z >= growthMaxMultiplier.z
             if !reachedMax {
                 stillGrowing.append(entry)
             }
+        }
+
+        growthLogCounter += 1
+        if growthLogCounter % 60 == 0 && !growingDebris.isEmpty {
+            let sample = growingDebris[0]
+            let id = ObjectIdentifier(sample.entity)
+            let stored = growthMultipliers[id] ?? .zero
+            print("[Growth] growing=\(growingDebris.count) mult=\(sample.multiplier) stored=\(stored) base=\(sample.baseScale)")
         }
 
         growingDebris = stillGrowing
@@ -489,6 +574,139 @@ final class BoneDebrisManager {
         }
     }
 
+    // MARK: - Settling State Processing (Option C)
+
+    /// Transitions debris through ejecting → settling → settled states.
+    /// Settled debris has its physics body switched to kinematic, preventing drift.
+    func processSettling() {
+        guard isEnabled else { return }
+
+        for entity in drawnEntities {
+            guard let modelEntity = entity as? ModelEntity,
+                  modelEntity.parent != nil else { continue }
+
+            let id = ObjectIdentifier(modelEntity)
+            let currentState = debrisStates[id] ?? .ejecting
+
+            switch currentState {
+            case .ejecting:
+                // Check if ejection impulse has been applied (no longer in pendingEjections).
+                let stillPending = pendingEjections.contains { $0.entity === modelEntity }
+                if !stillPending {
+                    debrisStates[id] = .settling
+                    settlingCounters[id] = 0
+                }
+
+            case .settling:
+                // Only freeze debris that is near the bone surface (SDF-based).
+                // Prevents debris from freezing mid-air when adhesion friction
+                // damps velocity before it reaches a resting surface.
+                let position = modelEntity.position(relativeTo: debrisContainer)
+                let sdfDist = abs(sampleSDF(at: position))
+                let nearSurface = sdfDist < adhesionFrictionThreshold
+
+                let velocity = modelEntity.components[PhysicsMotionComponent.self]?.linearVelocity ?? .zero
+                let speed = simd_length(velocity)
+
+                if speed < settlingVelocityThreshold && nearSurface {
+                    let count = (settlingCounters[id] ?? 0) + 1
+                    settlingCounters[id] = count
+                    if count >= settlingFrameCount {
+                        if var physics = modelEntity.components[PhysicsBodyComponent.self] {
+                            physics.mode = .kinematic
+                            modelEntity.components.set(physics)
+                        }
+                        if var motion = modelEntity.components[PhysicsMotionComponent.self] {
+                            motion.linearVelocity = .zero
+                            motion.angularVelocity = .zero
+                            modelEntity.components.set(motion)
+                        }
+                        debrisStates[id] = .settled
+                        settlingCounters.removeValue(forKey: id)
+                    }
+                } else {
+                    settlingCounters[id] = 0
+                }
+
+            case .settled:
+                // Already frozen — nothing to do here.
+                // Tool displacement is handled in processToolDisplacement().
+                break
+            }
+        }
+    }
+
+    // MARK: - Tool Displacement Processing (Option B)
+
+    /// Pushes settled debris outward when the tool passes near them.
+    /// Creates the "smearing" effect seen in real surgery where the burr
+    /// drags and pushes accumulated slurry.
+    func processToolDisplacement(toolPosition: SIMD3<Float>) {
+        guard isEnabled else { return }
+
+        let radiusSq = toolDisplacementRadius * toolDisplacementRadius
+
+        for entity in drawnEntities {
+            guard let modelEntity = entity as? ModelEntity,
+                  modelEntity.parent != nil else { continue }
+
+            let id = ObjectIdentifier(modelEntity)
+            let state = debrisStates[id] ?? .ejecting
+
+            // Only displace settled or settling debris.
+            guard state == .settled || state == .settling else { continue }
+
+            let debrisPos = modelEntity.position(relativeTo: debrisContainer)
+            let delta = debrisPos - toolPosition
+            let distSq = simd_length_squared(delta)
+
+            guard distSq < radiusSq, distSq > 1e-8 else { continue }
+
+            let dist = sqrt(distSq)
+            let pushDir = delta / dist  // normalized direction away from tool
+            let falloff = 1.0 - (dist / toolDisplacementRadius)  // stronger when closer
+
+            if state == .settled {
+                // Unfreeze temporarily: switch back to dynamic for the push.
+                if var physics = modelEntity.components[PhysicsBodyComponent.self] {
+                    physics.mode = .dynamic
+                    modelEntity.components.set(physics)
+                }
+                // Reset to settling so it can re-settle after displacement.
+                debrisStates[id] = .settling
+                settlingCounters[id] = 0
+            }
+
+            let force = pushDir * toolDisplacementForce * falloff
+            modelEntity.addForce(force, relativeTo: nil)
+        }
+    }
+
+    // MARK: - Out-of-Bounds Culling
+
+    /// Remove debris that has left the sculpting volume bounds.
+    func cullOutOfBoundsDebris() {
+        let bMin = volumeBoundsMin
+        let bMax = volumeBoundsMax
+        var i = 0
+        while i < drawnEntities.count {
+            let entity = drawnEntities[i]
+            let pos = entity.position(relativeTo: debrisContainer)
+            if pos.x < bMin.x || pos.y < bMin.y || pos.z < bMin.z ||
+               pos.x > bMax.x || pos.y > bMax.y || pos.z > bMax.z {
+                let id = ObjectIdentifier(entity)
+                debrisStates.removeValue(forKey: id)
+                settlingCounters.removeValue(forKey: id)
+                growthMultipliers.removeValue(forKey: id)
+                spawnTimes.removeValue(forKey: id)
+                entity.removeFromParent()
+                drawnEntities.remove(at: i)
+            } else {
+                i += 1
+            }
+        }
+    }
+
     private func orientationAlongDirection(_ direction: SIMD3<Float>) -> simd_quatf {
         let dir = simd_length(direction) > 0.0001 ? simd_normalize(direction) : SIMD3<Float>(0, 0, 1)
         let forward = SIMD3<Float>(0, 0, -1)
@@ -512,6 +730,10 @@ final class BoneDebrisManager {
         drawnEntities.removeAll()
         pendingEjections.removeAll()
         growingDebris.removeAll()
+        debrisStates.removeAll()
+        settlingCounters.removeAll()
+        growthMultipliers.removeAll()
+        spawnTimes.removeAll()
     }
 
     func undoLastStroke(count: Int = 50) {

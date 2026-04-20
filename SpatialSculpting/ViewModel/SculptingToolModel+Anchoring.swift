@@ -125,7 +125,7 @@ extension SculptingToolModel {
         // In general: tipZ = drillModel.position.z + scaledBounds.min.z
         let tipZ = drillModel.position.z + scaledBounds.min.z
         // X/Y offset compensates for the drill overlay being slightly off the stylus axis.
-        let tipPosition = SIMD3<Float>(-0.005, 0.001, tipZ)
+        let tipPosition = SIMD3<Float>(-0.003, 0.001, tipZ) //orig(-0.005,0.001, tipZ)
 
         // Create spinning drill ball at the tip, centered on the shaft axis.
         let drillBall = DrillRotationComponent.createDrillBall(rpm: 400)

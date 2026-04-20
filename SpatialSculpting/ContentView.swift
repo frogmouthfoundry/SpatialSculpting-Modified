@@ -23,6 +23,13 @@ struct ContentView: View {
     @State var saveDocument: VolumeDocument? = nil
     @State var isSaving = false
 
+    // Volume transparency toggle (50% transparent when on).
+    @State private var isVolumeTransparent: Bool = false
+
+    // Volume scale tracking: 1.0 = original size; each press changes by 0.1.
+    // Minimum allowed = 0.4 (40% of original). Maximum = 1.0 (original size).
+    @State private var volumeScaleFactor: Float = 1.0
+
     // Build initial voxel volume from bundled package manifest when available.
     private static func initialVolumeConfig() -> (dimensions: SIMD3<UInt32>,
                                                   voxelSize: SIMD3<Float>,
@@ -130,6 +137,11 @@ struct ContentView: View {
             // Set up the bone debris manager with the root entity and SDF access.
             if let voxelVolume = marchingCubesMesh?.voxelVolume {
                 sculpting.boneDebrisManager.setup(rootEntity: root, voxelVolume: voxelVolume)
+                // Lock slurry grid to the same bounds as the sculpting volume.
+                let dims = SIMD3<Float>(voxelVolume.dimensions)
+                let bMin = voxelVolume.voxelStartPosition - voxelVolume.voxelSize * 0.5
+                let bMax = voxelVolume.voxelStartPosition + voxelVolume.voxelSize * (dims - 0.5)
+                sculpting.boneSlurryGrid?.configure(volumeBoundsMin: bMin, volumeBoundsMax: bMax)
             } else {
                 sculpting.boneDebrisManager.setup(rootEntity: root)
             }
@@ -244,7 +256,7 @@ struct ContentView: View {
                 }
             }
         } label: {
-            Text("Open")
+            Text("Load")
         }
     }
 
@@ -290,15 +302,6 @@ struct ContentView: View {
         }
     }
 
-    func diagnoseButton() -> some View {
-        Button {
-            if let root = sculpting.rootEntity {
-                PhysicsDiagnostics.runAll(rootEntity: root)
-            }
-        } label: {
-            Text("Diagnose")
-        }
-    }
 
     func dropSphereButton() -> some View {
         Button {
@@ -336,6 +339,60 @@ struct ContentView: View {
         Button { rotateVolume(axis: SIMD3<Float>(0, 0, 1)) } label: { Text("Rot Z") }
     }
 
+    // MARK: - Volume Transparency
+
+    /// Apply or remove 50% transparency on all sculpt mesh chunks.
+    private func applyVolumeTransparency(_ transparent: Bool) {
+        let opacity: Float = transparent ? 0.5 : 1.0
+        for child in root.children where child.name == "SculptMeshChunk" {
+            if transparent {
+                child.components.set(OpacityComponent(opacity: opacity))
+            } else {
+                child.components.remove(OpacityComponent.self)
+            }
+        }
+    }
+
+    func toggleTransparencyButton() -> some View {
+        Button {
+            isVolumeTransparent.toggle()
+            applyVolumeTransparency(isVolumeTransparent)
+        } label: {
+            Text(isVolumeTransparent ? "Opaque" : "Transparent")
+        }
+    }
+
+    // MARK: - Volume Scale
+
+    /// Scale the sculpting volume (mesh chunks + bone slurry + collision) uniformly.
+    /// Drill overlay, drill ball, and sculpting tool head are NOT affected since
+    /// they are positioned relative to the accessory anchor, not the root entity.
+    private func applyVolumeScale(_ scale: Float) {
+        root.transform.scale = SIMD3<Float>(repeating: scale)
+    }
+
+    func shrinkVolumeButton() -> some View {
+        Button {
+            let newScale = max(0.4, volumeScaleFactor - 0.1)
+            volumeScaleFactor = newScale
+            applyVolumeScale(newScale)
+        } label: {
+            Text("Shrink")
+        }
+        .disabled(volumeScaleFactor <= 0.41)
+    }
+
+    func growVolumeButton() -> some View {
+        Button {
+            let newScale = min(1.0, volumeScaleFactor + 0.1)
+            volumeScaleFactor = newScale
+            applyVolumeScale(newScale)
+        } label: {
+            Text("Grow")
+        }
+        .disabled(volumeScaleFactor >= 0.99)
+    }
+
     //Final Consolidated View
     var body: some View {
         ZStack {
@@ -347,37 +404,36 @@ struct ContentView: View {
                         HStack {
                             saveButton()
                             openButton()
-                            clearButton()
-                            resetButton()
-                            toggleDebrisDrawingButton()
                             clearDebrisButton()
-                            toggleGravityButton()
-                            diagnoseButton()
-                            dropSphereButton()
                         }
                         HStack {
                             rotateXButton()
                             rotateYButton()
                             rotateZButton()
                         }
+                        HStack {
+                            toggleTransparencyButton()
+                            shrinkVolumeButton()
+                            growVolumeButton()
+                        }
                     }.padding().glassBackgroundEffect()
                 }
             //end Sculpting Volume
 
-            /*
+            
             //Additional 3D Content
             RealityView { content in
 
-                guard let stageEntity = try? Entity.load(named: "Staging") else {
-                    print("Failed to find Staging Entity")
+                guard let earEntity = try? Entity.load(named: "EarStructure") else {
+                    print("Failed to find Ear Structure")
                     return }
 
-                stageEntity.scale *= 0.3
-                //stageEntity.transform.translation += SIMD3(0,0,0.1)
-                content.add(stageEntity)
+                earEntity.scale *= 4.5
+                earEntity.transform.translation += SIMD3(0,0,-0.39)
+                content.add(earEntity)
             }
             //end Additional 3D Content
-             */
+             
         }
     }
 }
