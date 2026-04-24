@@ -12,3 +12,4 @@ Bridging header for sculpting implementation.
 #include "Sculpting/SculptParams.h"
 #include "Volume/VolumeParams.h"
 #include "BoneDebris/BoneSlurryParams.h"
+#include "Fluid/WaveMeshTypes.h"

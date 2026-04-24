@@ -10,6 +10,7 @@ import ARKit
 import RealityKit
 import GameController
 import CoreHaptics
+import QuartzCore
 
 struct ContentView: View {
     var root: Entity = Entity(components: [ComputeSystemComponent(computeSystem: SculptingToolSystem())])
@@ -22,6 +23,9 @@ struct ContentView: View {
 
     @State var saveDocument: VolumeDocument? = nil
     @State var isSaving = false
+    @State private var fluidWaveMesh: AnimatedWaveMesh? = nil
+    @State private var fluidWaveEntity: ModelEntity? = nil
+    @State private var lastFluidRippleTimestamp: TimeInterval = 0
 
     // Volume transparency toggle (50% transparent when on).
     @State private var isVolumeTransparent: Bool = false
@@ -106,6 +110,61 @@ struct ContentView: View {
         return meshChunkEntity
     }
 
+    private func createFluidLayerIfNeeded() {
+        guard fluidWaveEntity == nil else { return }
+        do {
+            let waveMesh = try AnimatedWaveMesh()
+            waveMesh.segmentCount = 128
+            waveMesh.waveDensity = 3.0
+            waveMesh.amplitude = 0.0
+            waveMesh.speed = 1.0
+
+            let meshResource = try MeshResource(from: waveMesh.lowLevelMesh)
+            var material = PhysicallyBasedMaterial()
+            material.baseColor.tint = .init(red: 0.78, green: 0.76, blue: 0.78, alpha: 1.0)
+            if let normalTexture = try? TextureResource.load(named: "water 0397cbormal") {
+                material.normal.texture = .init(normalTexture)
+            } else {
+                print("Fluid normal texture not found: water 0397cbormal")
+            }
+            material.roughness.scale = 0.20
+            material.metallic.scale = 0.0
+            material.blending = .transparent(opacity: 0.82)
+            material.faceCulling = .none
+
+            let entity = ModelEntity(mesh: meshResource, materials: [material])
+            entity.name = "FluidLayer"
+            entity.position = SIMD3<Float>(0, -0.22, 0)
+            entity.scale = SIMD3<Float>(0.64, 0.8, 0.64)
+            root.addChild(entity)
+
+            fluidWaveMesh = waveMesh
+            fluidWaveEntity = entity
+        } catch {
+            print("Failed to create fluid layer: \(error)")
+        }
+    }
+
+    private func updateFluidLayer(timestep: TimeInterval) {
+        fluidWaveMesh?.update(timestep)
+        triggerFluidRippleIfNeeded()
+    }
+
+    private func triggerFluidRippleIfNeeded() {
+        guard let waveMesh = fluidWaveMesh, let fluidEntity = fluidWaveEntity else { return }
+        let toolPositionInFluidSpace = fluidEntity.convert(position: sculpting.sculptingTool.position, from: root)
+        guard abs(toolPositionInFluidSpace.x) < 0.5,
+              abs(toolPositionInFluidSpace.z) < 0.5,
+              abs(toolPositionInFluidSpace.y) < 0.03 else {
+            return
+        }
+
+        let now = CACurrentMediaTime()
+        guard now - lastFluidRippleTimestamp > 0.07 else { return }
+        lastFluidRippleTimestamp = now
+        waveMesh.triggerRipple(at: SIMD2<Float>(toolPositionInFluidSpace.x, toolPositionInFluidSpace.z))
+    }
+
     func sculptingVolume() -> some View {
         RealityView { content, attachments in
             // Initialize visionOS bundled reality-material path (if bundled).
@@ -130,6 +189,9 @@ struct ContentView: View {
             if let slurryEntity = sculpting.boneSlurryGrid?.entity {
                 root.addChild(slurryEntity)
             }
+
+            // Add animated fluid layer mesh.
+            createFluidLayerIfNeeded()
 
             content.add(root)
             sculpting.rootEntity = root
@@ -158,8 +220,9 @@ struct ContentView: View {
 
             // Update sculpting tool and check for tracking quality each frame.
             _ = content.subscribe(to: SceneEvents.Update.self) {
-                _ in
+                event in
                 sculpting.updateSculptingTool()
+                updateFluidLayer(timestep: event.deltaTime)
             }
 
             if let additiveAttachment = attachments.entity(for: "Additive") {
@@ -420,20 +483,20 @@ struct ContentView: View {
                 }
             //end Sculpting Volume
 
-            
+            /*
             //Additional 3D Content
             RealityView { content in
 
-                guard let earEntity = try? Entity.load(named: "EarStructure") else {
+                guard let stageEntity = try? Entity.load(named: "EarStructure") else {
                     print("Failed to find Ear Structure")
                     return }
 
-                earEntity.scale *= 4.5
-                earEntity.transform.translation += SIMD3(0,0,-0.39)
-                content.add(earEntity)
+                stageEntity.scale *= 0.3
+                //stageEntity.transform.translation += SIMD3(0,0,0.1)
+                content.add(stageEntity)
             }
             //end Additional 3D Content
-             
+             */
         }
     }
 }
