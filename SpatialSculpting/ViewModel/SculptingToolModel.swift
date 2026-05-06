@@ -335,8 +335,10 @@ final class SculptingToolModel {
 
         // Compute live drill model/bit world transforms directly from anchor + cached
         // local transforms. This keeps carving/collision aligned to visuals.
-        let liveModelTransform = liveDrillModelWorldTransform(anchorTransform: liveAnchorTransform)
-        let liveBallTransform = liveDrillBallWorldTransform(anchorTransform: liveAnchorTransform)
+        let liveModelTransform = currentLiveDrillModelTransform(rootEntity: rootEntity,
+                                                                anchorTransform: liveAnchorTransform)
+        let liveBallTransform = currentLiveDrillBallTransform(rootEntity: rootEntity,
+                                                              anchorTransform: liveAnchorTransform)
 
         // Compute live sculpting tool pose (tip-centered) from anchor.
         var liveToolTransform = liveAnchorTransform
@@ -553,6 +555,22 @@ final class SculptingToolModel {
         guard let local = drillBallDefaultLocalTransform else { return nil }
         let worldMatrix = anchorTransform.matrix * local.matrix
         return Transform(matrix: worldMatrix)
+    }
+
+    private func currentLiveDrillModelTransform(rootEntity: Entity,
+                                                anchorTransform: Transform) -> Transform? {
+        if !isDrillOverlayDetachedForFreeze, let drillModel = drillModelEntity {
+            return Transform(matrix: drillModel.transformMatrix(relativeTo: rootEntity))
+        }
+        return liveDrillModelWorldTransform(anchorTransform: anchorTransform)
+    }
+
+    private func currentLiveDrillBallTransform(rootEntity: Entity,
+                                               anchorTransform: Transform) -> Transform? {
+        if !isDrillOverlayDetachedForFreeze, let drillBall = drillBallEntity {
+            return Transform(matrix: drillBall.transformMatrix(relativeTo: rootEntity))
+        }
+        return liveDrillBallWorldTransform(anchorTransform: anchorTransform)
     }
 
     private func interpolateTransform(_ from: Transform, _ to: Transform, _ t: Float) -> Transform {
