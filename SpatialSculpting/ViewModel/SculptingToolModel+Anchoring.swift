@@ -41,6 +41,10 @@ extension SculptingToolModel {
             }
         }
         walk(drillModel)
+        if let drillBall = drillBallEntity,
+           let model = drillBall.components[ModelComponent.self] {
+            cache.append((drillBall, model.materials))
+        }
         _cachedDrillMaterials = cache
     }
 
@@ -48,18 +52,25 @@ extension SculptingToolModel {
     func tintDrillRed() {
         guard !_isDrillTintedRed else { return }
         _isDrillTintedRed = true
-        guard let drillModel = drillModelEntity else { return }
         let redMaterial = SimpleMaterial(color: .red, roughness: 0.3, isMetallic: false)
-        func walk(_ entity: Entity) {
-            if var model = entity.components[ModelComponent.self] {
-                model.materials = Array(repeating: redMaterial, count: model.materials.count)
-                entity.components.set(model)
+        if let drillModel = drillModelEntity {
+            func walk(_ entity: Entity) {
+                if var model = entity.components[ModelComponent.self] {
+                    model.materials = Array(repeating: redMaterial, count: model.materials.count)
+                    entity.components.set(model)
+                }
+                for child in entity.children {
+                    walk(child)
+                }
             }
-            for child in entity.children {
-                walk(child)
+            walk(drillModel)
+        }
+        if var ballModel = drillBallEntity?.components[ModelComponent.self] {
+            ballModel.materials = Array(repeating: redMaterial, count: ballModel.materials.count)
+            if let drillBall = drillBallEntity {
+                drillBall.components.set(ballModel)
             }
         }
-        walk(drillModel)
     }
 
     /// Restore original drill materials after shaft collision clears.
@@ -72,6 +83,36 @@ extension SculptingToolModel {
                 entity.components.set(model)
             }
         }
+    }
+
+    /// Tint all sculpt mesh chunks red in sync with shaft-collision drill tint.
+    func tintSculptMeshRed() {
+        guard !_isSculptMeshTintedRed else { return }
+        guard let root = rootEntity else { return }
+
+        _cachedSculptMeshMaterials.removeAll()
+        let redMaterial = SimpleMaterial(color: .red, roughness: 0.3, isMetallic: false)
+        for child in root.children where child.name == "SculptMeshChunk" {
+            if var model = child.components[ModelComponent.self] {
+                _cachedSculptMeshMaterials.append((child, model.materials))
+                model.materials = Array(repeating: redMaterial, count: max(model.materials.count, 1))
+                child.components.set(model)
+            }
+        }
+        _isSculptMeshTintedRed = true
+    }
+
+    /// Restore original sculpt mesh chunk materials after collision clears.
+    func restoreSculptMeshMaterials() {
+        guard _isSculptMeshTintedRed else { return }
+        _isSculptMeshTintedRed = false
+        for (entity, materials) in _cachedSculptMeshMaterials {
+            if var model = entity.components[ModelComponent.self] {
+                model.materials = materials
+                entity.components.set(model)
+            }
+        }
+        _cachedSculptMeshMaterials.removeAll()
     }
 
     // Add a visual tooltip to indicate where sculpting occurs.
@@ -116,9 +157,7 @@ extension SculptingToolModel {
 
         anchor.addChild(drillModel)
         drillModelEntity = drillModel
-
-        // Cache original materials for shaft collision tint/restore.
-        cacheDrillMaterials()
+        drillModelDefaultLocalTransform = drillModel.transform
 
         // Compute the drill tip position in anchor-local space.
         // The positioning math above places the model's min-Z face at Z = -0.05.
@@ -132,6 +171,10 @@ extension SculptingToolModel {
         drillBall.position = tipPosition
         anchor.addChild(drillBall)
         drillBallEntity = drillBall
+        drillBallDefaultLocalTransform = drillBall.transform
+
+        // Cache original materials for shaft collision tint/restore (model + bit).
+        cacheDrillMaterials()
 
         // Store the tip offset so updateSculptingTool() can use it for sculpting position.
         drillBallLocalOffset = tipPosition

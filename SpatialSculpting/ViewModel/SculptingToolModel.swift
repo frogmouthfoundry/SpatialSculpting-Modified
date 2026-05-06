@@ -8,6 +8,7 @@ A model of the sculpting.
 import SwiftUI
 import RealityKit
 import ARKit
+import QuartzCore
 
 @MainActor @Observable
 final class SculptingToolModel {
@@ -52,6 +53,28 @@ final class SculptingToolModel {
     var _cachedDrillMaterials: [(Entity, [any RealityKit.Material])] = []
     /// Whether the drill is currently tinted red due to shaft collision.
     var _isDrillTintedRed: Bool = false
+    /// Cached original materials for sculpt mesh chunks while collision tinting is active.
+    var _cachedSculptMeshMaterials: [(Entity, [any RealityKit.Material])] = []
+    /// Whether sculpt mesh chunks are currently tinted red due to shaft collision.
+    var _isSculptMeshTintedRed: Bool = false
+
+    // Shaft collision freeze/recovery state.
+    private let shaftFreezeDuration: TimeInterval = 0.5
+    private let shaftRecoveryDuration: TimeInterval = 0.4
+    private var isShaftFrozen: Bool = false
+    private var isShaftRecovering: Bool = false
+    private var freezeEndTime: TimeInterval = 0
+    private var recoveryStartTime: TimeInterval = 0
+    private var frozenToolTransform: Transform = Transform()
+    private var frozenDrillModelTransform: Transform? = nil
+    private var frozenDrillBallTransform: Transform? = nil
+    private var recoveryStartToolTransform: Transform = Transform()
+    private var recoveryStartDrillModelTransform: Transform? = nil
+    private var recoveryStartDrillBallTransform: Transform? = nil
+    private var isDrillOverlayDetachedForFreeze: Bool = false
+    private var cachedDrillBallRPMBeforeFreeze: Int? = nil
+    var drillModelDefaultLocalTransform: Transform? = nil
+    var drillBallDefaultLocalTransform: Transform? = nil
 
     // Tracks carving state for logging and particle bursts
     private var wasCarving: Bool = false
@@ -303,52 +326,131 @@ final class SculptingToolModel {
         guard let sculptingEntity = sculptingEntity else {
             return
         }
-        guard let rootEntity = rootEntity, let matrix = try? sculptingEntity.transform(from: rootEntity) else {
+        guard let rootEntity = rootEntity,
+              let liveAnchorMatrix = try? sculptingEntity.transform(from: rootEntity) else {
             return
         }
-        // Update the sculpting tool with the sculpting tool's transform.
-        // This ensures it can carve into the correct part of virtual clay.
-        sculptingTool.transform = Transform(matrix: simd_float4x4(matrix))
-        
-        // Offset sculpting position to match the drill ball tip (centered on shaft axis).
-        // drillBallLocalOffset is computed from the USDZ bounds in attachDrillModel()
-        // and lives in anchor-local space. sculptingTool.position is in root-local space
-        // (already divided by root.scale via transform(from:)). We must also divide the
-        // offset by root.scale so it matches the root-local coordinate system.
-        let rotatedOffset = sculptingTool.transform.rotation.act(drillBallLocalOffset)
-        let rootScale = rootEntity.transform.scale
-        let safeScale = SIMD3<Float>(
-            abs(rootScale.x) > 1e-6 ? rootScale.x : 1.0,
-            abs(rootScale.y) > 1e-6 ? rootScale.y : 1.0,
-            abs(rootScale.z) > 1e-6 ? rootScale.z : 1.0
-        )
-        sculptingTool.position += rotatedOffset / safeScale
+        // Live anchor transform from accessory in root-local space.
+        let liveAnchorTransform = Transform(matrix: simd_float4x4(liveAnchorMatrix))
+
+        // Compute live drill model/bit world transforms directly from anchor + cached
+        // local transforms. This keeps carving/collision aligned to visuals.
+        let liveModelTransform = liveDrillModelWorldTransform(anchorTransform: liveAnchorTransform)
+        let liveBallTransform = liveDrillBallWorldTransform(anchorTransform: liveAnchorTransform)
+
+        // Compute live sculpting tool pose (tip-centered) from anchor.
+        var liveToolTransform = liveAnchorTransform
+        if let ballTransform = liveBallTransform {
+            // Use drill-bit world position/orientation as the exact carving tip pose.
+            liveToolTransform.translation = ballTransform.translation
+            liveToolTransform.rotation = ballTransform.rotation
+        } else {
+            // Fallback to anchor-local offset math while detached/recovering.
+            let rotatedOffset = liveToolTransform.rotation.act(drillBallLocalOffset)
+            let rootScale = rootEntity.transform.scale
+            let safeScale = SIMD3<Float>(
+                abs(rootScale.x) > 1e-6 ? rootScale.x : 1.0,
+                abs(rootScale.y) > 1e-6 ? rootScale.y : 1.0,
+                abs(rootScale.z) > 1e-6 ? rootScale.z : 1.0
+            )
+            liveToolTransform.translation += rotatedOffset / safeScale
+        }
 
         // --- Shaft collision detection ---
         // The shaft extends from the tip backward along the drill's local +Z axis
         // (the USDZ model body goes in +Z from the tip).
-        let shaftDirection = sculptingTool.transform.rotation.act(SIMD3<Float>(0, 0, 1))
+        let shaftDirection = (liveModelTransform?.rotation ?? liveToolTransform.rotation).act(SIMD3<Float>(0, 0, 1))
         let shaftResult = shaftCollisionDetector.test(
-            tipPosition: sculptingTool.position,
+            tipPosition: liveToolTransform.translation,
             shaftDirection: simd_normalize(shaftDirection),
             collisionManager: collisionManager
         )
 
+        let now = CACurrentMediaTime()
+
         if shaftResult.isColliding {
-            // Physical blocking: push the tool out of the volume.
-            sculptingTool.position += shaftResult.correctionVector
-            // Visual feedback: tint drill red.
+            // Visual feedback: tint drill + sculpt volume red.
             tintDrillRed()
+            tintSculptMeshRed()
             // Haptic feedback: sharp warning pulse.
             hapticsModel?.startShaftCollisionFeedback()
+
+            // Repeating freeze cycle while collision persists.
+            if !isShaftFrozen && !isShaftRecovering {
+                startShaftFreeze(now: now,
+                                 liveToolTransform: liveToolTransform,
+                                 liveModelTransform: liveModelTransform,
+                                 liveBallTransform: liveBallTransform)
+            } else if isShaftFrozen && now >= freezeEndTime {
+                startShaftRecovery(now: now)
+            }
         } else {
             // Clear visual and haptic warnings.
             restoreDrillMaterials()
+            restoreSculptMeshMaterials()
             hapticsModel?.stopShaftCollisionFeedback()
+
+            // If collision just cleared, transition from freeze to recovery.
+            if isShaftFrozen {
+                startShaftRecovery(now: now)
+            }
         }
 
-        // Always sculpt when the device is present
-        sculptingTool.components[SculptingToolComponent.self]?.isActive = true
+        // Drive tool + drill transforms based on collision freeze/recovery state.
+        if isShaftFrozen {
+            // Hard hold for 50 ms.
+            sculptingTool.transform = frozenToolTransform
+            if let modelTransform = frozenDrillModelTransform {
+                drillModelEntity?.transform = modelTransform
+            }
+            if let ballTransform = frozenDrillBallTransform {
+                drillBallEntity?.transform = ballTransform
+            }
+        } else if isShaftRecovering {
+            // Interpolate back to the live stylus pose over 25 ms.
+            let t = Float(min(1.0, max(0.0, (now - recoveryStartTime) / shaftRecoveryDuration)))
+            sculptingTool.transform = interpolateTransform(recoveryStartToolTransform, liveToolTransform, t)
+
+            if let modelStart = recoveryStartDrillModelTransform,
+               let modelTarget = liveDrillModelWorldTransform(anchorTransform: liveAnchorTransform) {
+                drillModelEntity?.transform = interpolateTransform(modelStart, modelTarget, t)
+            }
+            if let ballStart = recoveryStartDrillBallTransform,
+               let ballTarget = liveDrillBallWorldTransform(anchorTransform: liveAnchorTransform) {
+                drillBallEntity?.transform = interpolateTransform(ballStart, ballTarget, t)
+            }
+
+            if t >= 1 {
+                finishShaftRecovery()
+                // If still colliding, immediately start the next freeze cycle.
+                if shaftResult.isColliding {
+                    startShaftFreeze(now: now,
+                                     liveToolTransform: liveToolTransform,
+                                     liveModelTransform: liveModelTransform,
+                                     liveBallTransform: liveBallTransform)
+                }
+            }
+        } else {
+            // Normal anchored behavior.
+            sculptingTool.transform = liveToolTransform
+        }
+
+        // Apply blocking correction only in normal mode to avoid jitter during freeze/recovery.
+        if shaftResult.isColliding && !isShaftFrozen && !isShaftRecovering {
+            sculptingTool.position += shaftResult.correctionVector
+        }
+
+        // Pause carving/tool logic while frozen or recovering.
+        let carvingBlocked = isShaftFrozen || isShaftRecovering
+        sculptingTool.components[SculptingToolComponent.self]?.isActive = !carvingBlocked
+
+        if carvingBlocked {
+            if wasCarving {
+                print("[Drill] Idle")
+                wasCarving = false
+            }
+            return
+        }
         
         // Log carving state using the SDF value sampled on the GPU.
         // SDF <= 0 means the tool is at or inside the mesh surface.
@@ -375,6 +477,91 @@ final class SculptingToolModel {
         let isActive = sculptingTool.components[SculptingToolComponent.self]?.isActive ?? false
         boneDebrisManager.update(sculptingTool: sculptingTool)
          */
+    }
+
+    // MARK: - Shaft Collision Freeze / Recovery
+
+    private func startShaftFreeze(now: TimeInterval,
+                                  liveToolTransform: Transform,
+                                  liveModelTransform: Transform?,
+                                  liveBallTransform: Transform?) {
+        guard let root = rootEntity else { return }
+
+        // Capture the exact aligned freeze pose before detaching.
+        frozenToolTransform = liveToolTransform
+        frozenDrillModelTransform = liveModelTransform ?? drillModelEntity?.transform
+        frozenDrillBallTransform = liveBallTransform ?? drillBallEntity?.transform
+        if let ballTransform = frozenDrillBallTransform {
+            frozenToolTransform.translation = ballTransform.translation
+            frozenToolTransform.rotation = ballTransform.rotation
+        }
+
+        if !isDrillOverlayDetachedForFreeze {
+            detachDrillOverlayFromAnchor(to: root)
+        }
+
+        isShaftRecovering = false
+        isShaftFrozen = true
+        freezeEndTime = now + shaftFreezeDuration
+    }
+
+    private func startShaftRecovery(now: TimeInterval) {
+        isShaftFrozen = false
+        isShaftRecovering = true
+        recoveryStartTime = now
+
+        recoveryStartToolTransform = sculptingTool.transform
+        recoveryStartDrillModelTransform = drillModelEntity?.transform
+        recoveryStartDrillBallTransform = drillBallEntity?.transform
+    }
+
+    private func finishShaftRecovery() {
+        isShaftRecovering = false
+        reattachDrillOverlayToAnchor()
+    }
+
+    private func detachDrillOverlayFromAnchor(to root: Entity) {
+        drillModelEntity?.setParent(root, preservingWorldTransform: true)
+        drillBallEntity?.setParent(root, preservingWorldTransform: true)
+        if var rotation = drillBallEntity?.components[DrillRotationComponent.self] {
+            cachedDrillBallRPMBeforeFreeze = rotation.rpm
+            rotation.rpm = 0
+            drillBallEntity?.components.set(rotation)
+        }
+        isDrillOverlayDetachedForFreeze = true
+    }
+
+    private func reattachDrillOverlayToAnchor() {
+        guard isDrillOverlayDetachedForFreeze, let anchor = sculptingEntity else { return }
+        drillModelEntity?.setParent(anchor, preservingWorldTransform: true)
+        drillBallEntity?.setParent(anchor, preservingWorldTransform: true)
+        if var rotation = drillBallEntity?.components[DrillRotationComponent.self] {
+            rotation.rpm = cachedDrillBallRPMBeforeFreeze ?? rotation.rpm
+            drillBallEntity?.components.set(rotation)
+        }
+        cachedDrillBallRPMBeforeFreeze = nil
+        isDrillOverlayDetachedForFreeze = false
+    }
+
+    private func liveDrillModelWorldTransform(anchorTransform: Transform) -> Transform? {
+        guard let local = drillModelDefaultLocalTransform else { return nil }
+        let worldMatrix = anchorTransform.matrix * local.matrix
+        return Transform(matrix: worldMatrix)
+    }
+
+    private func liveDrillBallWorldTransform(anchorTransform: Transform) -> Transform? {
+        guard let local = drillBallDefaultLocalTransform else { return nil }
+        let worldMatrix = anchorTransform.matrix * local.matrix
+        return Transform(matrix: worldMatrix)
+    }
+
+    private func interpolateTransform(_ from: Transform, _ to: Transform, _ t: Float) -> Transform {
+        let tt = max(0, min(1, t))
+        return Transform(
+            scale: simd_mix(from.scale, to.scale, SIMD3<Float>(repeating: tt)),
+            rotation: simd_slerp(from.rotation, to.rotation, tt),
+            translation: simd_mix(from.translation, to.translation, SIMD3<Float>(repeating: tt))
+        )
     }
     
     // Add the attachment to the root entity.
