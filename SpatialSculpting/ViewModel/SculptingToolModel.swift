@@ -30,6 +30,7 @@ final class SculptingToolModel {
     var reduceIcon: Entity? = nil
 
     var hapticsModel: HapticsModel? = nil
+    var drillAudioModel: DrillAudioModel? = nil
 
     // Sculpt material management
     var loadedRoughnessValue: Float = 0.5
@@ -57,10 +58,12 @@ final class SculptingToolModel {
     var _cachedSculptMeshMaterials: [(Entity, [any RealityKit.Material])] = []
     /// Whether sculpt mesh chunks are currently tinted red due to shaft collision.
     var _isSculptMeshTintedRed: Bool = false
+    /// Temporary debug visual for the cylindrical shaft collision detector.
+    var shaftCollisionDebugMarker: ModelEntity? = nil
 
     // Shaft collision freeze/recovery state.
-    private let shaftFreezeDuration: TimeInterval = 0.5
-    private let shaftRecoveryDuration: TimeInterval = 0.4
+    private let shaftFreezeDuration: TimeInterval = 0.3
+    private let shaftRecoveryDuration: TimeInterval = 0.2
     private var isShaftFrozen: Bool = false
     private var isShaftRecovering: Bool = false
     private var freezeEndTime: TimeInterval = 0
@@ -78,9 +81,26 @@ final class SculptingToolModel {
 
     // Tracks carving state for logging and particle bursts
     private var wasCarving: Bool = false
+    private let carvingRadiusMargin: Float = 0.0005
+    private let carvingFramesRequired: Int = 2
+    private let idleFramesRequired: Int = 2
+    private var carvingFrameStreak: Int = 0
+    private var idleFrameStreak: Int = 0
+    private let debrisSimulationInterval: TimeInterval = 1.0 / 60.0
+    private var lastDebrisSimulationTime: TimeInterval = 0
+    private let boneDustBurstInterval: TimeInterval = 0.15
+    private var lastBoneDustBurstTime: TimeInterval = -.greatestFiniteMagnitude
+    private let boneDustNormalResampleBurstInterval: Int = 5
+    private var cachedBoneDustSurfaceNormal: SIMD3<Float>? = nil
+    private var boneDustBurstsSinceLastNormalSample: Int = .max
 
-    /// Pre-loaded BoneDust template entity — cloned on each burst to avoid disk I/O.
+    /// Pre-loaded BoneDust template entity used to populate the reusable burst pool.
     private var boneDustTemplate: Entity? = nil
+    private let boneDustPoolSize: Int = 12
+    private var availableBoneDustEntities: [Entity] = []
+    private var activeBoneDustActivationIDs: [ObjectIdentifier: UInt64] = [:]
+    private var activeBoneDustEntities: [ObjectIdentifier: Entity] = [:]
+    private var nextBoneDustActivationID: UInt64 = 0
     
     /// Manages the drawing of bone debris box volumes when the tool contacts the sculpted volume.
     let boneDebrisManager = BoneDebrisManager()
@@ -252,6 +272,10 @@ final class SculptingToolModel {
         guard let accessoryAnchor = getAccessoryAnchor(entity: sculptingEntity) else {
             return
         }
+
+        // Reassert drill tracking audio every frame so it recovers if playback stops
+        // during heavy scene work such as bundled volume loading.
+        updateDrillTrackingAudio(for: accessoryAnchor.trackingState)
         
         if var sculptingToolComponent = sculptingTool.components[SculptingToolComponent.self] {
             if sculptingToolComponent.trackingState != accessoryAnchor.trackingState {
@@ -264,6 +288,7 @@ final class SculptingToolModel {
                 } else {
                     trackingStateIndicator?.isEnabled = false
                 }
+                sculptingTool.components.set(sculptingToolComponent)
             }
         }
     }
@@ -274,24 +299,21 @@ final class SculptingToolModel {
         // Process collision updates before the sculptingEntity guard
         // so initial/scheduled regeneration works even without a connected stylus.
         collisionManager.processUpdatesIfNeeded()
+        if !collisionManager.hasSDFCache {
+            collisionManager.scheduleRegeneration()
+        }
 
         // Process pending debris ejection forces (frame countdown).
-        boneDebrisManager.processPendingEjections()
-
-        // Process debris growth animation.
-        boneDebrisManager.processGrowth()
-
-        // Process SDF adhesion forces on all debris.
-        boneDebrisManager.processAdhesion()
-
-        // Process settling state machine: ejecting → settling → settled.
-        boneDebrisManager.processSettling()
-
-        // Process tool displacement: push settled slurry when burr passes nearby.
-        boneDebrisManager.processToolDisplacement(toolPosition: sculptingTool.position)
-
-        // Request periodic SDF blit for debris adhesion.
-        boneDebrisManager.requestSdfBlitIfNeeded()
+        let now = CACurrentMediaTime()
+        if now - lastDebrisSimulationTime >= debrisSimulationInterval {
+            lastDebrisSimulationTime = now
+            boneDebrisManager.processPendingEjections()
+            boneDebrisManager.processGrowth()
+            boneDebrisManager.processAdhesion()
+            boneDebrisManager.processSettling()
+            boneDebrisManager.processToolDisplacement(toolPosition: sculptingTool.position)
+            boneDebrisManager.requestSdfBlitIfNeeded()
+        }
 
         // If collision manager needs a blit, set the request on the component.
         if collisionManager.blitRequested,
@@ -326,6 +348,7 @@ final class SculptingToolModel {
         guard let sculptingEntity = sculptingEntity else {
             return
         }
+        updateTrackingStateIndicatorIfDirty(sculptingEntity: sculptingEntity)
         guard let rootEntity = rootEntity,
               let liveAnchorMatrix = try? sculptingEntity.transform(from: rootEntity) else {
             return
@@ -361,16 +384,23 @@ final class SculptingToolModel {
         // --- Shaft collision detection ---
         // The shaft extends from the tip backward along the drill's local +Z axis
         // (the USDZ model body goes in +Z from the tip).
-        let shaftDirection = (liveModelTransform?.rotation ?? liveToolTransform.rotation).act(SIMD3<Float>(0, 0, 1))
+        let shaftAxis = (liveModelTransform?.rotation ?? liveToolTransform.rotation).act(SIMD3<Float>(0, 0, 1))
+        let shaftDirection = simd_length_squared(shaftAxis) > 1e-8 ? simd_normalize(shaftAxis) : SIMD3<Float>(0, 0, 1)
         let shaftResult = shaftCollisionDetector.test(
             tipPosition: liveToolTransform.translation,
-            shaftDirection: simd_normalize(shaftDirection),
+            shaftDirection: shaftDirection,
             collisionManager: collisionManager
         )
 
-        let now = CACurrentMediaTime()
-
         if shaftResult.isColliding {
+            // DEBUG ONLY: Uncomment to visualize the temporary cylindrical shaft
+            // collision detector while tuning alignment.
+            // let detectorCenter = liveToolTransform.translation + shaftDirection * shaftCollisionDetector.detectorCenterOffset
+            // updateShaftCollisionDebugMarker(center: detectorCenter,
+            //                                 axis: shaftDirection,
+            //                                 length: shaftCollisionDetector.detectorLength,
+            //                                 radius: shaftCollisionDetector.detectorRadius,
+            //                                 collisionPoint: shaftResult.collisionPoint)
             // Visual feedback: tint drill + sculpt volume red.
             tintDrillRed()
             tintSculptMeshRed()
@@ -387,6 +417,8 @@ final class SculptingToolModel {
                 startShaftRecovery(now: now)
             }
         } else {
+            // DEBUG ONLY: Paired with the commented visualization above.
+            // hideShaftCollisionDebugMarker()
             // Clear visual and haptic warnings.
             restoreDrillMaterials()
             restoreSculptMeshMaterials()
@@ -447,6 +479,10 @@ final class SculptingToolModel {
         sculptingTool.components[SculptingToolComponent.self]?.isActive = !carvingBlocked
 
         if carvingBlocked {
+            hapticsModel?.stopSculptVibration()
+            updateDrillCarvingAudio(isCarving: false)
+            carvingFrameStreak = 0
+            idleFrameStreak = 0
             if wasCarving {
                 print("[Drill] Idle")
                 wasCarving = false
@@ -456,16 +492,36 @@ final class SculptingToolModel {
         
         // Log carving state using the SDF value sampled on the GPU.
         // SDF <= 0 means the tool is at or inside the mesh surface.
-        if let sculptor = sculptingTool.components[SculptingToolComponent.self]?.sculptor {
+        if let sculptingToolComponent = sculptingTool.components[SculptingToolComponent.self] {
+            let sculptor = sculptingToolComponent.sculptor
             let sdf = sculptor.lastSampledSDF
-            let isCarving = sdf <= 0
+            let isCarving = updateCarvingState(sampledSDF: sdf,
+                                               toolRadius: sculptingToolComponent.radius,
+                                               isToolActive: sculptingToolComponent.isActive)
             if isCarving != wasCarving {
                 print(isCarving ? "[Drill] Carving" : "[Drill] Idle")
                 if isCarving {
-                    triggerBoneDustBurst()
                     boneDebrisManager.update(sculptingTool: sculptingTool)
+                    hapticsModel?.startSculptVibration()
+                    updateDrillCarvingAudio(isCarving: true)
+                    triggerBoneDustBurstIfNeeded(force: true,
+                                                 shaftDirection: shaftDirection)
+                } else {
+                    stopAllBoneDustBursts()
+                    hapticsModel?.stopSculptVibration()
+                    updateDrillCarvingAudio(isCarving: false)
                 }
                 wasCarving = isCarving
+            }
+            if isCarving {
+                hapticsModel?.startSculptVibration()
+                updateDrillCarvingAudio(isCarving: true)
+                triggerBoneDustBurstIfNeeded(force: false,
+                                             shaftDirection: shaftDirection)
+            } else {
+                stopAllBoneDustBursts()
+                hapticsModel?.stopSculptVibration()
+                updateDrillCarvingAudio(isCarving: false)
             }
             // Throttled collision update while carving.
             if isCarving {
@@ -598,24 +654,143 @@ final class SculptingToolModel {
         Task { @MainActor in
             if let template = try? await Entity(named: "BoneDust") {
                 self.boneDustTemplate = template
+                self.buildBoneDustPoolIfNeeded()
             } else {
                 print("[BoneDust] Failed to pre-load BoneDust.usdz")
             }
         }
     }
 
-    /// Spawn a clone of the pre-loaded BoneDust entity at the drill tip, let it play, then destroy it.
-    private func triggerBoneDustBurst() {
-        guard let root = rootEntity,
+    private func buildBoneDustPoolIfNeeded() {
+        guard availableBoneDustEntities.isEmpty,
+              activeBoneDustActivationIDs.isEmpty,
               let template = boneDustTemplate else { return }
-        let dustEntity = template.clone(recursive: true)
-        dustEntity.position = sculptingTool.position
+        for index in 0..<boneDustPoolSize {
+            let dustEntity = template.clone(recursive: true)
+            dustEntity.name = "BoneDustPooled_\(index)"
+            dustEntity.isEnabled = false
+            availableBoneDustEntities.append(dustEntity)
+        }
+    }
+
+    private func triggerBoneDustBurstIfNeeded(force: Bool, shaftDirection: SIMD3<Float>) {
+        let now = CACurrentMediaTime()
+        guard force || now - lastBoneDustBurstTime >= boneDustBurstInterval else { return }
+        lastBoneDustBurstTime = now
+        triggerBoneDustBurst(shaftDirection: shaftDirection)
+    }
+
+    /// Borrow a pooled BoneDust entity, orient it to the carved surface normal,
+    /// then return it to the pool after its burst lifetime elapses.
+    private func triggerBoneDustBurst(shaftDirection: SIMD3<Float>) {
+        guard let root = rootEntity,
+              boneDustTemplate != nil else { return }
+        buildBoneDustPoolIfNeeded()
+        guard let dustEntity = availableBoneDustEntities.popLast() else { return }
+        let surfaceNormal = preferredBoneDustSurfaceNormal(fallbackShaftDirection: shaftDirection)
+        nextBoneDustActivationID &+= 1
+        let activationID = nextBoneDustActivationID
+        let entityID = ObjectIdentifier(dustEntity)
+        activeBoneDustActivationIDs[entityID] = activationID
+        activeBoneDustEntities[entityID] = dustEntity
+        dustEntity.transform = Transform(
+            scale: dustEntity.scale,
+            rotation: rotationAligningUpVector(to: surfaceNormal),
+            translation: sculptingTool.position
+        )
+        dustEntity.isEnabled = true
         root.addChild(dustEntity)
 
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(1500))
+            guard self.activeBoneDustActivationIDs[entityID] == activationID else { return }
+            self.activeBoneDustActivationIDs.removeValue(forKey: entityID)
+            self.activeBoneDustEntities.removeValue(forKey: entityID)
+            dustEntity.isEnabled = false
             dustEntity.removeFromParent()
+            self.availableBoneDustEntities.append(dustEntity)
         }
+    }
+
+    private func stopAllBoneDustBursts() {
+        guard !activeBoneDustEntities.isEmpty else { return }
+        let activeEntities = activeBoneDustEntities
+        activeBoneDustActivationIDs.removeAll()
+        activeBoneDustEntities.removeAll()
+        for (entityID, entity) in activeEntities {
+            entity.isEnabled = false
+            entity.removeFromParent()
+            if !availableBoneDustEntities.contains(where: { ObjectIdentifier($0) == entityID }) {
+                availableBoneDustEntities.append(entity)
+            }
+        }
+    }
+
+    private func preferredBoneDustSurfaceNormal(fallbackShaftDirection: SIMD3<Float>) -> SIMD3<Float> {
+        let shouldResample = cachedBoneDustSurfaceNormal == nil ||
+            boneDustBurstsSinceLastNormalSample >= boneDustNormalResampleBurstInterval
+        if shouldResample {
+            let gradient = collisionManager.sampleSDFGradient(at: sculptingTool.position)
+            if simd_length_squared(gradient) > 1e-8 {
+                let normal = simd_normalize(gradient)
+                cachedBoneDustSurfaceNormal = normal
+                boneDustBurstsSinceLastNormalSample = 0
+                return normal
+            }
+        }
+        boneDustBurstsSinceLastNormalSample &+= 1
+        if let cachedBoneDustSurfaceNormal {
+            return cachedBoneDustSurfaceNormal
+        }
+        return simd_normalize(-fallbackShaftDirection)
+    }
+
+    private func updateCarvingState(sampledSDF: Float,
+                                    toolRadius: Float,
+                                    isToolActive: Bool) -> Bool {
+        guard isToolActive, sampledSDF.isFinite else {
+            carvingFrameStreak = 0
+            idleFrameStreak = 0
+            return false
+        }
+
+        // The sculpting sphere influences the volume when its radius overlaps the
+        // surface. Since `sampleSDF` measures distance from the tool center, actual
+        // carve/contact starts when `sampledSDF <= toolRadius`.
+        let enterThreshold = toolRadius - carvingRadiusMargin
+        let exitThreshold = toolRadius + carvingRadiusMargin
+        let wantsCarving = sampledSDF <= enterThreshold
+        let wantsIdle = sampledSDF >= exitThreshold
+
+        if wantsCarving {
+            carvingFrameStreak += 1
+            idleFrameStreak = 0
+        } else if wantsIdle {
+            idleFrameStreak += 1
+            carvingFrameStreak = 0
+        } else {
+            carvingFrameStreak = 0
+            idleFrameStreak = 0
+        }
+
+        if wasCarving {
+            return idleFrameStreak < idleFramesRequired
+        }
+        return carvingFrameStreak >= carvingFramesRequired
+    }
+
+    private func rotationAligningUpVector(to targetUp: SIMD3<Float>) -> simd_quatf {
+        let from = SIMD3<Float>(0, 1, 0)
+        let to = simd_length_squared(targetUp) > 1e-8 ? simd_normalize(targetUp) : from
+        let dot = simd_dot(from, to)
+        if dot > 0.9999 {
+            return simd_quatf(angle: 0, axis: SIMD3<Float>(0, 0, 1))
+        }
+        if dot < -0.9999 {
+            return simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 0, 1))
+        }
+        let axis = simd_normalize(simd_cross(from, to))
+        return simd_quatf(angle: acos(simd_clamp(dot, -1.0, 1.0)), axis: axis)
     }
 
 }

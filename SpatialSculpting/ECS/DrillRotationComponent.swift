@@ -36,10 +36,12 @@ class DrillRotationSystem: System {
 
 // MARK: - Drill Ball Factory
 extension DrillRotationComponent {
+    static let defaultBallRadius: Float = 0.006
+
     /// Creates a small rotating sphere for the drill tip.
     @MainActor
     static func createDrillBall(rpm: Int = 400) -> ModelEntity {
-        let ballRadius: Float = 0.005
+        let ballRadius = defaultBallRadius
         let ballMesh = MeshResource.generateSphere(radius: ballRadius)
 
         var material = PhysicallyBasedMaterial()

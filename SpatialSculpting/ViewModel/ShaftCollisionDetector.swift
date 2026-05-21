@@ -29,19 +29,16 @@ final class ShaftCollisionDetector {
 
     // MARK: - Configuration
 
-    /// Distance from the drill tip before shaft sampling begins (meters).
-    /// Leaves a "cutting zone" gap immediately around the burr so legitimate
-    /// tip contact doesn't trigger the shaft-collision alert. Increasing this
-    /// value moves both the collision detection AND the red-tint / haptic
-    /// warning further up the shaft (away from the tip).
-    private let shaftStartOffset: Float = 0.005 // 0.5 cm
-    /// How far past the start offset the shaft is sampled (meters).
-    private let shaftLength: Float = 0.08       // 8 cm
-    /// Number of evenly-spaced sample points along the shaft.
-    private let sampleCount: Int = 10
-    /// Approximate shaft radius (meters).  SDF values more negative than
-    /// -shaftRadius indicate the shaft surface is inside the volume.
-    private let shaftRadius: Float = 0.004      // 4 mm
+    /// Detector center measured from the drill tip back along the shaft axis.
+    let detectorCenterOffset: Float = 0.02 // 2 cm
+    /// Short cylindrical detector length centered on `detectorCenterOffset`.
+    let detectorLength: Float = 0.014 // 1.4 cm
+    /// Approximate drill shaft radius at the detector position.
+    let detectorRadius: Float = 0.004
+    /// Number of sample slices along the short cylinder.
+    private let axialSampleCount: Int = 5
+    /// Number of points sampled around the cylinder ring per slice.
+    private let radialSampleCount: Int = 8
 
     // MARK: - API
 
@@ -56,32 +53,50 @@ final class ShaftCollisionDetector {
     func test(tipPosition: SIMD3<Float>,
               shaftDirection: SIMD3<Float>,
               collisionManager: CollisionManager) -> ShaftCollisionResult {
-
         var deepestSDF: Float = .greatestFiniteMagnitude
         var deepestPoint: SIMD3<Float> = .zero
-        var deepestIndex: Int = -1
+        var foundSample = false
+        let axis = simd_length_squared(shaftDirection) > 1e-8 ? simd_normalize(shaftDirection) : SIMD3<Float>(0, 0, 1)
+        let detectorCenter = tipPosition + axis * detectorCenterOffset
+        let halfLength = detectorLength * 0.5
 
-        let step = shaftLength / Float(sampleCount - 1)
+        let referenceUp = abs(simd_dot(axis, SIMD3<Float>(0, 1, 0))) < 0.95
+            ? SIMD3<Float>(0, 1, 0)
+            : SIMD3<Float>(1, 0, 0)
+        let radialX = simd_normalize(simd_cross(axis, referenceUp))
+        let radialY = simd_normalize(simd_cross(axis, radialX))
 
-        for i in 0..<sampleCount {
-            // Start sampling shaftStartOffset behind the tip so the cutting
-            // burr zone does not trigger the shaft-collision alert.
-            let t = shaftStartOffset + Float(i) * step
-            let worldPos = tipPosition + shaftDirection * t
-
-            guard let sdfValue = collisionManager.sampleSDF(at: worldPos) else {
-                continue // point outside volume bounds
-            }
-
+        func considerPoint(_ worldPos: SIMD3<Float>) {
+            guard let sdfValue = collisionManager.sampleSDF(at: worldPos) else { return }
+            foundSample = true
             if sdfValue < deepestSDF {
                 deepestSDF = sdfValue
                 deepestPoint = worldPos
-                deepestIndex = i
             }
         }
 
-        // No collision: all shaft points are outside the surface.
-        guard deepestSDF < -shaftRadius, deepestIndex >= 0 else {
+        if axialSampleCount <= 1 {
+            considerPoint(detectorCenter)
+        } else {
+            for i in 0..<axialSampleCount {
+                let t = Float(i) / Float(axialSampleCount - 1)
+                let axialOffset = -halfLength + detectorLength * t
+                let sliceCenter = detectorCenter + axis * axialOffset
+
+                // Sample the center and a ring on the cylinder surface so the
+                // detector fires when the shaft surface touches the volume.
+                considerPoint(sliceCenter)
+                for j in 0..<radialSampleCount {
+                    let angle = (Float(j) / Float(radialSampleCount)) * (.pi * 2)
+                    let ringOffset = radialX * cos(angle) * detectorRadius
+                                   + radialY * sin(angle) * detectorRadius
+                    considerPoint(sliceCenter + ringOffset)
+                }
+            }
+        }
+
+        // No collision: all cylinder samples are outside the surface.
+        guard foundSample, deepestSDF < 0 else {
             return ShaftCollisionResult(isColliding: false,
                                         correctionVector: .zero,
                                         collisionPoint: .zero,
@@ -98,11 +113,11 @@ final class ShaftCollisionDetector {
             normal = gradient / gradientLength
         } else {
             // Fallback: push along shaft direction (away from volume interior).
-            normal = -shaftDirection
+            normal = -axis
         }
 
-        // Penetration amount beyond the shaft radius.
-        let penetration = -(deepestSDF + shaftRadius)
+        // Surface sampling means any negative value is already penetration.
+        let penetration = -deepestSDF
         let correction = normal * penetration
 
         return ShaftCollisionResult(isColliding: true,

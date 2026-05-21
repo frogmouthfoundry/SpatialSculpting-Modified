@@ -32,7 +32,7 @@ final class BoneDebrisManager {
 
     /// Maximum number of debris entities allowed at once.
     /// Oldest debris are removed when this limit is exceeded.
-    private let maxDebrisCount: Int = 400
+    private let maxDebrisCount: Int = 100
 
     // MARK: - Ejection Force (tunable per-axis)
 
@@ -54,6 +54,10 @@ final class BoneDebrisManager {
     var growthInterval: TimeInterval = 0.05
     /// Per-axis maximum scale multiplier relative to spawn size. Capped lower for realistic scale.
     var growthMaxMultiplier: SIMD3<Float> = SIMD3<Float>(3.0, 3.0, 2.0)
+
+    /// Scale factor for newly spawned debris, driven by selected drill size.
+    /// 1.0 = baseline at 6mm drill. Applied only at spawn; existing debris keep their size.
+    var newDebrisSizeScale: Float = 1.0
 
     /// Debris currently growing: (entity, base scale at spawn, current per-axis multiplier, last tick time).
     private var growingDebris: [(entity: ModelEntity, baseScale: SIMD3<Float>, multiplier: SIMD3<Float>, lastTick: TimeInterval)] = []
@@ -413,7 +417,8 @@ final class BoneDebrisManager {
         // Initial scale = unit (mesh is already at debrisRadius).
         // debrisStretch elongates along Z. SDF modulates overall size.
         let sdfSizeScale = computeSDFSizeScale(at: position)
-        let stretchScale = SIMD3<Float>(1.0, 1.0, Self.debrisStretch) * sdfSizeScale
+        let clampedDebrisSizeScale = max(0.1, newDebrisSizeScale)
+        let stretchScale = SIMD3<Float>(1.0, 1.0, Self.debrisStretch) * sdfSizeScale * clampedDebrisSizeScale
 
         boxEntity.transform = Transform(
             scale: stretchScale,

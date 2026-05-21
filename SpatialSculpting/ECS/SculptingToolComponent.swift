@@ -35,7 +35,7 @@ struct SculptLoadPayload {
 struct SculptingToolComponent: Component {
     let sculptor: MarchingCubesMeshSculptor
     var mode: SculptingMode = .remove
-    var radius: Float = 0.005
+    var radius: Float = 0.006
     var isActive: Bool = false
     var reset: Bool = true
     var clear: Bool = false

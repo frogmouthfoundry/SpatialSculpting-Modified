@@ -15,6 +15,7 @@ GPU dispatch order each frame:
 import RealityKit
 import Metal
 import UIKit
+import QuartzCore
 
 @MainActor
 final class BoneSlurryGrid {
@@ -27,7 +28,7 @@ final class BoneSlurryGrid {
     private let maxVertexCapacity: Int = 300_000
 
     /// Maximum number of debris particles to upload.
-    private let maxParticleCount: Int = 400
+    private let maxParticleCount: Int = 100
 
     /// Iso-value threshold for surface extraction.
     /// Lower value = surfaces merge at greater distance → more paste-like.
@@ -78,6 +79,14 @@ final class BoneSlurryGrid {
     // MARK: - State
 
     private var params: BoneSlurryGridParams
+    private let uploadInterval: TimeInterval = 1.0 / 30.0
+    private var lastUploadTime: TimeInterval = 0
+    private let meshExtractionInterval: TimeInterval = 1.0 / 15.0
+    private var lastMeshExtractionTime: TimeInterval = 0
+    private var meshNeedsExtraction: Bool = false
+    private var lastParticleSignature: UInt64 = 0
+    private var lastUploadedParticleCount: UInt32 = 0
+    private var lastExtractedIsoValue: Float = .greatestFiniteMagnitude
 
     // MARK: - Debug
 
@@ -255,12 +264,15 @@ final class BoneSlurryGrid {
     /// Debris younger than spawnVisibilityDelay is excluded.
     func uploadParticles(from debrisManager: BoneDebrisManager,
                          rootEntity: Entity) {
+        let now = CACurrentMediaTime()
+        guard now - lastUploadTime >= uploadInterval else { return }
+        lastUploadTime = now
+
         params.isoValue = isoValue
         guard volumeConfigured else { return }
 
         let entities = debrisManager.drawnEntities
         let limit = min(entities.count, maxParticleCount)
-        let now = CACurrentMediaTime()
         let delay = debrisManager.spawnVisibilityDelay
 
         let ptr = particleBuffer.contents().bindMemory(
@@ -269,6 +281,7 @@ final class BoneSlurryGrid {
         )
 
         var validCount: Int = 0
+        var signature: UInt64 = 0xcbf29ce484222325
         for i in 0..<limit {
             guard let modelEntity = entities[i] as? ModelEntity,
                   modelEntity.parent != nil else { continue }
@@ -295,13 +308,24 @@ final class BoneSlurryGrid {
                 rotation: SIMD4<Float>(rot.imag.x, rot.imag.y, rot.imag.z, rot.real),
                 scale: scl
             )
+            signature = mixedParticleSignature(signature: signature,
+                                               position: pos,
+                                               rotation: rot,
+                                               scale: scl)
             validCount += 1
         }
 
         params.particleCount = UInt32(validCount)
+        let particleCount = params.particleCount
+        let isoChanged = abs(lastExtractedIsoValue - params.isoValue) > 0.0001
+        if particleCount != lastUploadedParticleCount || signature != lastParticleSignature || isoChanged {
+            meshNeedsExtraction = true
+            lastUploadedParticleCount = particleCount
+            lastParticleSignature = signature
+        }
 
         debugFrameCounter += 1
-        if debugFrameCounter <= 30 || debugFrameCounter % 60 == 0 {
+        if debugFrameCounter <= 0 {
             // Log scale range to verify growth reaches GPU
             var minScl: Float = Float.greatestFiniteMagnitude
             var maxScl: Float = 0
@@ -320,7 +344,19 @@ final class BoneSlurryGrid {
     // MARK: - GPU Dispatch (called from ComputeSystem)
 
     func update(computeContext: inout ComputeUpdateContext) {
+        let now = CACurrentMediaTime()
+        guard params.particleCount > 0 else {
+            entity.isEnabled = false
+            return
+        }
+        entity.isEnabled = true
+        guard meshNeedsExtraction,
+              now - lastMeshExtractionTime >= meshExtractionInterval else { return }
+
         guard let computeEncoder = computeContext.computeEncoder() else { return }
+        lastMeshExtractionTime = now
+        meshNeedsExtraction = false
+        lastExtractedIsoValue = params.isoValue
 
         let vertexBuffer = mesh.replace(bufferIndex: 0, using: computeContext.commandBuffer)
         let indexBuffer = mesh.replaceIndices(using: computeContext.commandBuffer)
@@ -332,8 +368,6 @@ final class BoneSlurryGrid {
         computeEncoder.setBuffer(indexBuffer, offset: 0, index: 1)
         computeEncoder.setBytes(&maxVerts, length: MemoryLayout<UInt32>.stride, index: 2)
         computeEncoder.dispatchThreadgroups(clearMeshThreadgroups, threadsPerThreadgroup: clearMeshThreadsPerThreadgroup)
-
-        guard params.particleCount > 0 else { return }
 
         // 2. Clear density
         var totalCount = totalVoxels
@@ -373,7 +407,7 @@ final class BoneSlurryGrid {
         computeEncoder.dispatchThreadgroups(marchThreadgroups, threadsPerThreadgroup: marchThreadsPerThreadgroup)
 
         // Periodic telemetry
-        let shouldLog = debugFrameCounter <= 30 || debugFrameCounter % 60 == 0
+        let shouldLog = false
         if shouldLog {
             let counterBufLocal = counterBuffer
             let frameNum = debugFrameCounter
@@ -385,5 +419,32 @@ final class BoneSlurryGrid {
                 print("[BoneSlurryGrid] \(status) frame=\(frameNum) tris=\(realTriCount)/\(maxVertsLocal/3) particles=\(particleCountLocal)")
             }
         }
+    }
+
+    private func mixedParticleSignature(signature: UInt64,
+                                        position: SIMD3<Float>,
+                                        rotation: simd_quatf,
+                                        scale: SIMD3<Float>) -> UInt64 {
+        var hash = signature
+        hash = mixHash(hash, quantized(position.x, step: 0.002))
+        hash = mixHash(hash, quantized(position.y, step: 0.002))
+        hash = mixHash(hash, quantized(position.z, step: 0.002))
+        hash = mixHash(hash, quantized(rotation.imag.x, step: 0.08))
+        hash = mixHash(hash, quantized(rotation.imag.y, step: 0.08))
+        hash = mixHash(hash, quantized(rotation.imag.z, step: 0.08))
+        hash = mixHash(hash, quantized(rotation.real, step: 0.08))
+        hash = mixHash(hash, quantized(scale.x, step: 0.05))
+        hash = mixHash(hash, quantized(scale.y, step: 0.05))
+        hash = mixHash(hash, quantized(scale.z, step: 0.05))
+        return hash
+    }
+
+    private func quantized(_ value: Float, step: Float) -> UInt64 {
+        UInt64(bitPattern: Int64((value / step).rounded(.toNearestOrEven)))
+    }
+
+    private func mixHash(_ hash: UInt64, _ value: UInt64) -> UInt64 {
+        let prime: UInt64 = 1099511628211
+        return (hash ^ value) &* prime
     }
 }

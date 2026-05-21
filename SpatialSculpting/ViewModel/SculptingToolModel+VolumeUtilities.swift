@@ -284,6 +284,7 @@ extension SculptingToolModel {
         }
 
         sculptingTool.components.set(sculptingToolComponent)
+        drillAudioModel?.refreshPlaybackAfterSceneWork()
     }
 
     // MARK: - Package Loading

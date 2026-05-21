@@ -17,6 +17,7 @@ struct ContentView: View {
 
     @State var sculpting: SculptingToolModel = SculptingToolModel()
     @State var haptics: HapticsModel = HapticsModel()
+    @State var drillAudio: DrillAudioModel = DrillAudioModel()
 
     let marchingCubesMesh: MarchingCubesMesh!
     let sculptor: MarchingCubesMeshSculptor!
@@ -26,6 +27,8 @@ struct ContentView: View {
     @State private var fluidWaveMesh: AnimatedWaveMesh? = nil
     @State private var fluidWaveEntity: ModelEntity? = nil
     @State private var lastFluidRippleTimestamp: TimeInterval = 0
+    @State private var selectedBitSizeMM: Int = 6
+    @State private var didApplyBitSizeToDrillBall: Bool = false
 
     // Volume transparency toggle (50% transparent when on).
     @State private var isVolumeTransparent: Bool = false
@@ -150,6 +153,38 @@ struct ContentView: View {
         triggerFluidRippleIfNeeded()
     }
 
+    private var selectedBitRadiusMeters: Float {
+        Float(selectedBitSizeMM) / 1000.0
+    }
+
+    private func applySelectedBitSize() {
+        let radius = selectedBitRadiusMeters
+        sculpting.sculptingTool.components[SculptingToolComponent.self]?.radius = radius
+        sculpting.boneDebrisManager.newDebrisSizeScale = radius / DrillRotationComponent.defaultBallRadius
+
+        if let drillBall = sculpting.drillBallEntity {
+            let scale = radius / DrillRotationComponent.defaultBallRadius
+            drillBall.scale = SIMD3<Float>(repeating: scale)
+            didApplyBitSizeToDrillBall = true
+        } else {
+            didApplyBitSizeToDrillBall = false
+        }
+    }
+
+    private func setBitSize(mm: Int) {
+        selectedBitSizeMM = mm
+        applySelectedBitSize()
+    }
+
+    @ViewBuilder
+    private func bitSizeButton(_ mm: Int) -> some View {
+        Button("\(mm)mm") {
+            setBitSize(mm: mm)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(selectedBitSizeMM == mm ? .green : .gray)
+    }
+
     private func triggerFluidRippleIfNeeded() {
         guard let waveMesh = fluidWaveMesh, let fluidEntity = fluidWaveEntity else { return }
         let toolPositionInFluidSpace = fluidEntity.convert(position: sculpting.sculptingTool.position, from: root)
@@ -178,6 +213,9 @@ struct ContentView: View {
                     }
                 }
             }
+
+            sculpting.drillAudioModel = drillAudio
+            drillAudio.prepareAudioIfNeeded()
 
             var toolComponent = SculptingToolComponent(sculptor: sculptor)
             toolComponent.boneSlurryGrid = sculpting.boneSlurryGrid
@@ -221,6 +259,9 @@ struct ContentView: View {
             // Update sculpting tool and check for tracking quality each frame.
             _ = content.subscribe(to: SceneEvents.Update.self) {
                 event in
+                if sculpting.drillBallEntity != nil, !didApplyBitSizeToDrillBall {
+                    applySelectedBitSize()
+                }
                 sculpting.updateSculptingTool()
                 updateFluidLayer(timestep: event.deltaTime)
             }
@@ -479,24 +520,33 @@ struct ContentView: View {
                             shrinkVolumeButton()
                             growVolumeButton()
                         }
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Bit Size")
+                                .font(.caption)
+                            HStack {
+                                bitSizeButton(6)
+                                bitSizeButton(4)
+                                bitSizeButton(2)
+                            }
+                        }
                     }.padding().glassBackgroundEffect()
                 }
             //end Sculpting Volume
 
-            /*
+            
             //Additional 3D Content
             RealityView { content in
 
-                guard let stageEntity = try? Entity.load(named: "EarStructure") else {
+                guard let innerEar = try? Entity.load(named: "EarStructure") else {
                     print("Failed to find Ear Structure")
                     return }
 
-                stageEntity.scale *= 0.3
-                //stageEntity.transform.translation += SIMD3(0,0,0.1)
-                content.add(stageEntity)
+                innerEar.scale *= 3.5
+                innerEar.transform.translation += SIMD3(0,0,-0.3)
+                content.add(innerEar)
             }
             //end Additional 3D Content
-             */
+             
         }
     }
 }

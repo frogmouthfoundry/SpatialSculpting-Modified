@@ -115,6 +115,47 @@ extension SculptingToolModel {
         _cachedSculptMeshMaterials.removeAll()
     }
 
+    /// Show the current cylindrical shaft detector zone in root space.
+    func updateShaftCollisionDebugMarker(center: SIMD3<Float>,
+                                         axis: SIMD3<Float>,
+                                         length: Float,
+                                         radius: Float,
+                                         collisionPoint: SIMD3<Float>) {
+        guard let root = rootEntity else { return }
+        if shaftCollisionDebugMarker == nil {
+            let marker = ModelEntity(
+                mesh: .generateBox(size: SIMD3<Float>(radius * 2, radius * 2, length)),
+                materials: [SimpleMaterial(color: .yellow.withAlphaComponent(0.55), roughness: 0.1, isMetallic: false)]
+            )
+            marker.name = "ShaftCollisionDebugMarker"
+            root.addChild(marker)
+            shaftCollisionDebugMarker = marker
+        }
+        let normalizedAxis = simd_length_squared(axis) > 1e-8 ? simd_normalize(axis) : SIMD3<Float>(0, 0, 1)
+        let from = SIMD3<Float>(0, 0, 1)
+        let dot = simd_dot(from, normalizedAxis)
+        let rotation: simd_quatf
+        if dot > 0.9999 {
+            rotation = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+        } else if dot < -0.9999 {
+            rotation = simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0))
+        } else {
+            let rotationAxis = simd_normalize(simd_cross(from, normalizedAxis))
+            rotation = simd_quatf(angle: acos(simd_clamp(dot, -1.0, 1.0)), axis: rotationAxis)
+        }
+        shaftCollisionDebugMarker?.transform = Transform(
+            scale: SIMD3<Float>(repeating: 1),
+            rotation: rotation,
+            translation: center
+        )
+        shaftCollisionDebugMarker?.isEnabled = true
+        _ = collisionPoint
+    }
+
+    func hideShaftCollisionDebugMarker() {
+        shaftCollisionDebugMarker?.isEnabled = false
+    }
+
     // Add a visual tooltip to indicate where sculpting occurs.
     // Also add a tracking state indicator to indicate when tracking may be
     // failing due to reduced sensor coverage.
@@ -178,6 +219,10 @@ extension SculptingToolModel {
 
         // Store the tip offset so updateSculptingTool() can use it for sculpting position.
         drillBallLocalOffset = tipPosition
+
+        // Attach spatial audio emitters to the drill overlay so playback follows
+        // the tool reliably in visionOS.
+        drillAudioModel?.attachSpatialAudio(to: drillModel, tipLocalPosition: tipPosition)
 
         print("Drill model and rotating ball attached at tip \(tipPosition)")
     }

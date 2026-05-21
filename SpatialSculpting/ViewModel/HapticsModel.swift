@@ -27,4 +27,8 @@ final class HapticsModel {
     var shaftCollisionPattern: CHHapticPattern? = nil
     var shaftCollisionPlayer: CHHapticPatternPlayer? = nil
     var isShaftCollisionPlaying: Bool = false
+
+    func ensureEngineRunning() {
+        try? hapticEngine?.start()
+    }
 }

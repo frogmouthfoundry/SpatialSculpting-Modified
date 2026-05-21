@@ -42,6 +42,10 @@ final class CollisionManager: @unchecked Sendable {
 
     /// Shared staging texture for CPU readback of SDF data.
     private var stagingTexture: MTLTexture?
+    /// CPU-cached SDF volume from the last completed blit.
+    /// Shaft collision sampling reads from this cache to avoid per-frame texture reads.
+    private var cachedSDFData: [Float] = []
+    private var hasValidSDFCache: Bool = false
 
     /// Volume parameters needed for CPU marching cubes.
     private var dimensions: SIMD3<UInt32> = .zero
@@ -53,6 +57,10 @@ final class CollisionManager: @unchecked Sendable {
     private var lastUpdateTime: TimeInterval = 0
     private var isRegenerating: Bool = false
     private var pendingRegeneration: Bool = false
+    /// Regenerate the expensive static collision mesh less frequently than SDF cache refresh.
+    private let fullMeshRegenerationInterval: TimeInterval = 1.5
+    private var lastFullMeshRegenerationTime: TimeInterval = 0
+    private var forceFullMeshRegeneration: Bool = true
 
     /// Set by scheduleRegeneration / processUpdatesIfNeeded.
     /// The SculptingToolSystem picks this up and triggers the blit.
@@ -76,6 +84,9 @@ final class CollisionManager: @unchecked Sendable {
         desc.usage = []
         desc.storageMode = .shared
         self.stagingTexture = metalDevice?.makeTexture(descriptor: desc)
+        let voxelCount = Int(dimensions.x) * Int(dimensions.y) * Int(dimensions.z)
+        self.cachedSDFData = [Float](repeating: 1.0, count: voxelCount)
+        self.hasValidSDFCache = false
 
         // Invisible collision entity.
         let entity = Entity()
@@ -91,6 +102,7 @@ final class CollisionManager: @unchecked Sendable {
     func scheduleRegeneration() {
         guard !pendingRegeneration else { return }
         pendingRegeneration = true
+        forceFullMeshRegeneration = true
         print("[CollisionManager] Scheduled regeneration (0.5s delay)")
 
         Task { @MainActor in
@@ -123,6 +135,7 @@ final class CollisionManager: @unchecked Sendable {
 
     /// Returns the staging texture for the compute system to blit into.
     var collisionStagingTexture: MTLTexture? { stagingTexture }
+    var hasSDFCache: Bool { hasValidSDFCache }
 
     /// Called by the compute system's completion handler after blit finishes.
     /// Runs CPU marching cubes and generates the static collision mesh.
@@ -148,9 +161,12 @@ final class CollisionManager: @unchecked Sendable {
         let w = Int(dims.x)
         let h = Int(dims.y)
         let d = Int(dims.z)
-        var sdfData = [Float](repeating: 0, count: w * h * d)
+        let voxelCount = w * h * d
+        if cachedSDFData.count != voxelCount {
+            cachedSDFData = [Float](repeating: 1.0, count: voxelCount)
+        }
 
-        sdfData.withUnsafeMutableBufferPointer { buf in
+        cachedSDFData.withUnsafeMutableBufferPointer { buf in
             texture.getBytes(
                 buf.baseAddress!,
                 bytesPerRow: w * MemoryLayout<Float>.size,
@@ -161,6 +177,16 @@ final class CollisionManager: @unchecked Sendable {
                 slice: 0
             )
         }
+        hasValidSDFCache = true
+
+        let now = CACurrentMediaTime()
+        let shouldRegenerateMesh = forceFullMeshRegeneration || (now - lastFullMeshRegenerationTime >= fullMeshRegenerationInterval)
+        guard shouldRegenerateMesh else {
+            // Fast path: keep SDF cache fresh for shaft collision without rebuilding static mesh.
+            return
+        }
+        forceFullMeshRegeneration = false
+        lastFullMeshRegenerationTime = now
 
         // 2. Run CPU marching cubes at coarse resolution.
         let isoValue: Float = 0
@@ -172,7 +198,7 @@ final class CollisionManager: @unchecked Sendable {
             guard x >= 0, x < w, y >= 0, y < h, z >= 0, z < d else {
                 return 1.0 // outside
             }
-            return sdfData[z * w * h + y * w + x]
+            return cachedSDFData[z * w * h + y * w + x]
         }
 
         // Cube vertex offsets (same convention as GPU kernel).
@@ -318,7 +344,7 @@ final class CollisionManager: @unchecked Sendable {
     /// Returns `nil` if the point is outside the volume bounds or the staging texture
     /// hasn't been blitted yet.
     func sampleSDF(at worldPosition: SIMD3<Float>) -> Float? {
-        guard let texture = stagingTexture, dimensions != .zero else { return nil }
+        guard dimensions != .zero else { return nil }
 
         // World → voxel coordinates (continuous).
         let voxelCoord = (worldPosition - voxelStartPosition) / voxelSize
@@ -336,7 +362,13 @@ final class CollisionManager: @unchecked Sendable {
             return nil // outside volume
         }
 
-        // Read a single float from the shared staging texture.
+        let index = iz * w * h + iy * w + ix
+        if hasValidSDFCache, index >= 0, index < cachedSDFData.count {
+            return cachedSDFData[index]
+        }
+
+        // Fallback for early startup/race windows before cache is populated.
+        guard let texture = stagingTexture else { return nil }
         var value: Float = 0
         let region = MTLRegion(origin: MTLOrigin(x: ix, y: iy, z: iz),
                                size: MTLSize(width: 1, height: 1, depth: 1))
