@@ -1,0 +1,71 @@
+#usda 1.0
+(
+    customLayerData = {
+        string creator = "Reality Composer Pro Version 2.0 (494.60.2)"
+    }
+    defaultPrim = "SculptGraphProxy"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+reorder rootPrims = ["SculptGraphProxy", "SculptGraphMaterial", "Root"]
+
+def Xform "Root" (
+    active = true
+)
+{
+    reorder nameChildren = ["SculptGraphProxy", "SculptGraphMaterial"]
+    quatf xformOp:orient = (1, 0, 0, 0)
+    float3 xformOp:scale = (1, 1, 1)
+    float3 xformOp:translate = (0, 0, 0)
+    uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+
+    def Cube "SculptGraphProxy" (
+        active = true
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </Root/SculptGraphMaterial> (
+            bindMaterialAs = "weakerThanDescendants"
+        )
+        double size = 0.2
+        quatf xformOp:orient = (1, 0, 0, 0)
+        float3 xformOp:scale = (1, 1, 1)
+        float3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+    }
+
+    def Material "SculptGraphMaterial"
+    {
+        token outputs:mtlx:surface.connect = </Root/SculptGraphMaterial/PBRSurface.outputs:out>
+        token outputs:realitykit:vertex
+        float2 ui:nodegraph:realitykit:subgraphOutputs:pos = (335.25, 100.5)
+        int ui:nodegraph:realitykit:subgraphOutputs:stackingOrder = 4
+
+        def Shader "PBRSurface"
+        {
+            uniform token info:id = "ND_realitykit_pbr_surfaceshader"
+            float inputs:ambientOcclusion
+            color3f inputs:baseColor.connect = </Root/SculptGraphMaterial/GeometryColor.outputs:out>
+            float inputs:clearcoat
+            float3 inputs:clearcoatNormal
+            float inputs:clearcoatRoughness
+            color3f inputs:emissiveColor
+            bool inputs:hasPremultipliedAlpha
+            float inputs:metallic
+            float3 inputs:normal
+            float inputs:roughness
+            token outputs:out
+            float2 ui:nodegraph:node:pos = (61.304688, 148.19922)
+            int ui:nodegraph:node:stackingOrder = 5
+        }
+
+        def Shader "GeometryColor"
+        {
+            uniform token info:id = "ND_geomcolor_color3"
+            color3f outputs:out
+            float2 ui:nodegraph:node:pos = (-270.21484, 66.27734)
+            int ui:nodegraph:node:stackingOrder = 8
+        }
+    }
+}
