@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "layout": "x_fastest",
+  "voxelOrigin": "center",
+  "grid": {
+    "width": 128,
+    "height": 128,
+    "depth": 128
+  },
+  "bounds": {
+    "min": [
+      -0.038455866277217865,
+      -0.0459589883685112,
+      -0.023220494389533997
+    ],
+    "max": [
+      0.027170900255441666,
+      0.03381062671542168,
+      0.046025585383176804
+    ]
+  },
+  "sdf": {
+    "file": "sdf.raw",
+    "format": "r32float",
+    "width": 128,
+    "height": 128,
+    "depth": 128
+  },
+  "albedo": {
+    "file": "albedo.raw",
+    "format": "rgba8unorm",
+    "width": 128,
+    "height": 128,
+    "depth": 128
+  },
+  "normal": {
+    "file": "normal.raw",
+    "format": "rgba8snorm",
+    "space": "object",
+    "width": 128,
+    "height": 128,
+    "depth": 128
+  },
+  "confidence": {
+    "file": "confidence.raw",
+    "format": "r8unorm",
+    "width": 128,
+    "height": 128,
+    "depth": 128
+  },
+  "mesh": {
+    "positionsFile": "mesh_positions.raw",
+    "normalsFile": "mesh_normals.raw",
+    "indicesFile": "mesh_indices.raw",
+    "vertexCount": 461662,
+    "indexCount": 2785380,
+    "topology": "triangles"
+  }
+}
