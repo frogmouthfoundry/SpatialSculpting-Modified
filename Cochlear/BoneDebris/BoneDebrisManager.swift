@@ -138,6 +138,7 @@ final class BoneDebrisManager {
     /// Spawn time per entity. Debris younger than `spawnVisibilityDelay` is
     /// excluded from the metaball grid so it appears invisible initially.
     private(set) var spawnTimes: [ObjectIdentifier: TimeInterval] = [:]
+    private(set) var spawnedDebrisSinceLastClear: Int = 0
 
     /// Seconds after spawn before debris becomes visible in the metaball mesh.
     let spawnVisibilityDelay: TimeInterval = 0.15
@@ -170,6 +171,10 @@ final class BoneDebrisManager {
     private var debrisMesh: MeshResource?
     private var debrisMaterial: (any Material)?
     private var physicsMaterial: PhysicsMaterialResource?
+    /// Temporary debug visual for the actual debris spawn position.
+    /// Debug-only: keep commented/isolated if we later remove it.
+    private var debrisSpawnDebugMarker: ModelEntity?
+    private var isSlurryDebugEnabled: Bool = false
 
     /// Cached capsule shape — created once and reused for all debris entities.
     private var cachedDebrisShape: ShapeResource?
@@ -359,10 +364,14 @@ final class BoneDebrisManager {
         guard component.isActive else { return }
 
         let currentPosition = sculptingTool.position
+        let liveShaftAxis = sculptingTool.transform.rotation.act(SIMD3<Float>(0, 0, 1))
+        let shaftDirection = simd_length(liveShaftAxis) > 0.0001 ? simd_normalize(liveShaftAxis) : SIMD3<Float>(0, 0, 1)
 
         guard let previousPosition = component.previousPosition else {
             // First frame of sculpt — place a single box.
-            placeBox(at: currentPosition, direction: SIMD3<Float>(0, 0, 1))
+            placeBox(at: currentPosition,
+                     direction: SIMD3<Float>(0, 0, 1),
+                     shaftDirection: shaftDirection)
             return
         }
 
@@ -376,19 +385,50 @@ final class BoneDebrisManager {
         for i in 1...steps {
             let t = Float(i) / Float(steps)
             let pos = simd_mix(previousPosition, currentPosition, SIMD3<Float>(repeating: t))
-            placeBox(at: pos, direction: direction)
+            placeBox(at: pos,
+                     direction: direction,
+                     shaftDirection: shaftDirection)
         }
     }
 
     // MARK: - Box Placement
 
-    /// Offset applied to push debris spawn point outward from the volume
-    /// surface. Prevents debris from spawning inside the collision mesh
-    /// (which would cause PhysX ejection). Direction: from volume center
-    /// toward spawn point (volume is centered at origin).
-    private let surfaceOffset: Float = 0.006  // 6 mm outward
+    /// Keep slurry generation visually attached to the burr rather than
+    /// pushing it outward from the sculpt volume.
+    private let surfaceOffset: Float = 0.0
+    /// Additional spawn offset from the burr center back toward the shaft.
+    private let shaftSpawnOffset: Float = 0.001 // 1 mm
 
-    private func placeBox(at position: SIMD3<Float>, direction: SIMD3<Float>) {
+    private func debrisSpawnPreviewPosition(position: SIMD3<Float>,
+                                            shaftDirection: SIMD3<Float>) -> SIMD3<Float> {
+        let outward = simd_length(position) > 0.001 ? simd_normalize(position) : SIMD3<Float>(0, 0, 1)
+        let normalizedShaftDirection = simd_length(shaftDirection) > 0.0001 ? simd_normalize(shaftDirection) : SIMD3<Float>(0, 0, 1)
+        return position + outward * surfaceOffset + normalizedShaftDirection * shaftSpawnOffset
+    }
+
+    /// Debug-only live preview of where a new debris particle would spawn.
+    func updateDebrisSpawnPreview(sculptingTool: Entity) {
+        guard isSlurryDebugEnabled else {
+            debrisSpawnDebugMarker?.isEnabled = false
+            return
+        }
+        let liveShaftAxis = sculptingTool.transform.rotation.act(SIMD3<Float>(0, 0, 1))
+        let shaftDirection = simd_length(liveShaftAxis) > 0.0001 ? simd_normalize(liveShaftAxis) : SIMD3<Float>(0, 0, 1)
+        let previewPosition = debrisSpawnPreviewPosition(position: sculptingTool.position,
+                                                         shaftDirection: shaftDirection)
+        updateDebrisSpawnDebugMarker(position: previewPosition)
+    }
+
+    func setSlurryDebugEnabled(_ isEnabled: Bool) {
+        isSlurryDebugEnabled = isEnabled
+        if !isEnabled {
+            debrisSpawnDebugMarker?.isEnabled = false
+        }
+    }
+
+    private func placeBox(at position: SIMD3<Float>,
+                          direction: SIMD3<Float>,
+                          shaftDirection: SIMD3<Float>) {
         guard let mesh = debrisMesh,
               let material = debrisMaterial,
               let container = debrisContainer,
@@ -405,9 +445,12 @@ final class BoneDebrisManager {
             oldest.removeFromParent()
         }
 
-        // Offset spawn position outward from the volume center (origin).
+        // Spawn slightly back toward the shaft so slurry originates just above
+        // the burr instead of appearing displaced off the tip.
         let outward = simd_length(position) > 0.001 ? simd_normalize(position) : SIMD3<Float>(0, 0, 1)
-        let offsetPosition = position + outward * surfaceOffset
+        let offsetPosition = debrisSpawnPreviewPosition(position: position,
+                                                        shaftDirection: shaftDirection)
+        updateDebrisSpawnDebugMarker(position: offsetPosition)
 
         let boxEntity = ModelEntity(mesh: mesh, materials: [material])
         boxEntity.name = "BoneDebris"
@@ -443,6 +486,7 @@ final class BoneDebrisManager {
 
         container.addChild(boxEntity)
         drawnEntities.append(boxEntity)
+        spawnedDebrisSinceLastClear += 1
 
         // Initialize settling state, growth multiplier, and spawn time.
         let entityId = ObjectIdentifier(boxEntity)
@@ -458,6 +502,25 @@ final class BoneDebrisManager {
 
         // Queue for gradual growth from spawn scale to max.
         growingDebris.append((entity: boxEntity, baseScale: stretchScale, multiplier: SIMD3<Float>(1, 1, 1), lastTick: CACurrentMediaTime()))
+    }
+
+    private func updateDebrisSpawnDebugMarker(position: SIMD3<Float>) {
+        guard isSlurryDebugEnabled else {
+            debrisSpawnDebugMarker?.isEnabled = false
+            return
+        }
+        guard let rootEntity else { return }
+        if debrisSpawnDebugMarker == nil {
+            let marker = ModelEntity(
+                mesh: .generateSphere(radius: 0.0025),
+                materials: [SimpleMaterial(color: .magenta.withAlphaComponent(0.9), roughness: 0.1, isMetallic: false)]
+            )
+            marker.name = "DebrisSpawnDebugMarker"
+            rootEntity.addChild(marker)
+            debrisSpawnDebugMarker = marker
+        }
+        debrisSpawnDebugMarker?.position = position
+        debrisSpawnDebugMarker?.isEnabled = true
     }
 
     /// Compute a size scale factor based on SDF distance at the spawn position.
@@ -739,6 +802,7 @@ final class BoneDebrisManager {
         settlingCounters.removeAll()
         growthMultipliers.removeAll()
         spawnTimes.removeAll()
+        spawnedDebrisSinceLastClear = 0
     }
 
     func undoLastStroke(count: Int = 50) {

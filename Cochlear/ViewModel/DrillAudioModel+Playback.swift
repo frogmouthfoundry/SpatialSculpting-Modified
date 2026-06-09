@@ -15,6 +15,7 @@ extension DrillAudioModel {
         trackingResource = makeLoopingResource(named: "drill_base.mp3")
         contactResource = makeLoopingResource(named: "drill_contact.mp3")
         alarmResource = makeOneShotResource(named: "alarm.mp3")
+        bloodResource = makeOneShotResource(named: "blood.mp3")
     }
 
     func setTrackingActive(_ isActive: Bool) {

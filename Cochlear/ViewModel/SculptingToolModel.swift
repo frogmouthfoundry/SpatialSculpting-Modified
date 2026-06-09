@@ -16,21 +16,22 @@ final class SculptingToolModel {
     let minRadius: Float = 0.002
     let maxRadius: Float = 0.5
 
-    var rootEntity: Entity? = nil // The root entity in the RealityView.
+    @ObservationIgnored var rootEntity: Entity? = nil // The root entity in the RealityView.
 
-    let sculptingTool = Entity(components: [ModelComponent(mesh: .generateSphere(radius: 0.001), materials: [SimpleMaterial()]),
-                                            OpacityComponent(opacity: 0.01)])
+    @ObservationIgnored let sculptingTool = Entity(components: [ModelComponent(mesh: .generateSphere(radius: 0.001), materials: [SimpleMaterial()]),
+                                                                OpacityComponent(opacity: 0.01)])
     
-    var sculptingEntity: AnchorEntity? = nil
-    var trackingStateIndicator: ModelEntity? = nil
+    @ObservationIgnored var sculptingEntity: AnchorEntity? = nil
+    @ObservationIgnored var trackingStateIndicator: ModelEntity? = nil
     
-    var additiveIcon: Entity? = nil
-    var subtractiveIcon: Entity? = nil
-    var enlargeIcon: Entity? = nil
-    var reduceIcon: Entity? = nil
+    @ObservationIgnored var additiveIcon: Entity? = nil
+    @ObservationIgnored var subtractiveIcon: Entity? = nil
+    @ObservationIgnored var enlargeIcon: Entity? = nil
+    @ObservationIgnored var reduceIcon: Entity? = nil
 
-    var hapticsModel: HapticsModel? = nil
-    var drillAudioModel: DrillAudioModel? = nil
+    @ObservationIgnored var hapticsModel: HapticsModel? = nil
+    @ObservationIgnored var drillAudioModel: DrillAudioModel? = nil
+    @ObservationIgnored var shouldClearDebris: Bool = false
 
     // Sculpt material management
     var loadedRoughnessValue: Float = 0.5
@@ -41,8 +42,8 @@ final class SculptingToolModel {
     private let sculptProxyEntityName = "SculptGraphProxy"
 
     // Drill overlay entities
-    var drillModelEntity: Entity? = nil
-    var drillBallEntity: ModelEntity? = nil
+    @ObservationIgnored var drillModelEntity: Entity? = nil
+    @ObservationIgnored var drillBallEntity: ModelEntity? = nil
     var selectedDrillBitScale: Float = 1.0
 
     /// Anchor-local offset from the accessory origin to the drill ball center.
@@ -50,7 +51,7 @@ final class SculptingToolModel {
     var drillBallLocalOffset = SIMD3<Float>(0, 0, -0.04)
 
     // Shaft collision detection
-    let shaftCollisionDetector = ShaftCollisionDetector()
+    @ObservationIgnored let shaftCollisionDetector = ShaftCollisionDetector()
     /// Cached original materials for the drill model (populated after attach).
     var _cachedDrillMaterials: [(Entity, [any RealityKit.Material])] = []
     /// Whether the drill is currently tinted red due to shaft collision.
@@ -59,14 +60,21 @@ final class SculptingToolModel {
     var _cachedSculptMeshMaterials: [(Entity, [any RealityKit.Material])] = []
     /// Whether sculpt mesh chunks are currently tinted red due to shaft collision.
     var _isSculptMeshTintedRed: Bool = false
+    /// Whether shaft collision warning visuals are currently active.
+    @ObservationIgnored var isShaftCollisionWarningActive: Bool = false
+    /// Whether anatomy-hazard sculpt flash visuals are currently active.
+    @ObservationIgnored var isAnatomyHazardFlashActive: Bool = false
     /// Temporary debug visual for the cylindrical shaft collision detector.
-    var shaftCollisionDebugMarker: ModelEntity? = nil
+    @ObservationIgnored var shaftCollisionDebugMarker: ModelEntity? = nil
+    /// Temporary debug visual for the live drill tip position.
+    @ObservationIgnored var drillTipDebugMarker: ModelEntity? = nil
+    @ObservationIgnored var isSlurryDebugEnabled: Bool = false
     var hazardFlashOpacity: Double = 0
-    var anatomyEffectsRoot: Entity? = nil
-    var anatomySafezones: [AnatomySafezoneSphere] = []
-    var activeAnatomyHazards: Set<AnatomyHazardKind> = []
-    var hazardFlashTask: Task<Void, Never>? = nil
-    var bloodSpurtTemplate: Entity? = nil
+    @ObservationIgnored var anatomyEffectsRoot: Entity? = nil
+    @ObservationIgnored var anatomySafezones: [AnatomySafezoneSphere] = []
+    @ObservationIgnored var activeAnatomyHazards: Set<AnatomyHazardKind> = []
+    @ObservationIgnored var hazardFlashTask: Task<Void, Never>? = nil
+    @ObservationIgnored var bloodSpurtTemplate: Entity? = nil
 
     // Shaft collision freeze/recovery state.
     private let shaftFreezeDuration: TimeInterval = 0.3
@@ -110,13 +118,15 @@ final class SculptingToolModel {
     private var nextBoneDustActivationID: UInt64 = 0
     
     /// Manages the drawing of bone debris box volumes when the tool contacts the sculpted volume.
-    let boneDebrisManager = BoneDebrisManager()
+    @ObservationIgnored let boneDebrisManager = BoneDebrisManager()
     
     /// Manages collision generation for the sculpting volume via CPU marching cubes.
-    let collisionManager = CollisionManager()
+    @ObservationIgnored let collisionManager = CollisionManager()
 
     /// 64^3 metaball density grid for unified debris visualization.
-    var boneSlurryGrid: BoneSlurryGrid? = BoneSlurryGrid()
+    /// Created lazily after the RealityView scene is live to avoid launch-time
+    /// LowLevelMesh/Metal initialization during Observation setup.
+    @ObservationIgnored var boneSlurryGrid: BoneSlurryGrid? = nil
 
     // MARK: - Sculpt Material
 
@@ -303,13 +313,6 @@ final class SculptingToolModel {
     // Every frame, update the interactions with in-app content
     // from the sculpting tool to the virtual clay.
     func updateSculptingTool() {
-        // Process collision updates before the sculptingEntity guard
-        // so initial/scheduled regeneration works even without a connected stylus.
-        collisionManager.processUpdatesIfNeeded()
-        if !collisionManager.hasSDFCache {
-            collisionManager.scheduleRegeneration()
-        }
-
         // Process pending debris ejection forces (frame countdown).
         let now = CACurrentMediaTime()
         if now - lastDebrisSimulationTime >= debrisSimulationInterval {
@@ -354,6 +357,12 @@ final class SculptingToolModel {
 
         guard let sculptingEntity = sculptingEntity else {
             return
+        }
+
+        // Collision/SDF refresh is only needed once a tracked tool exists.
+        collisionManager.processUpdatesIfNeeded()
+        if !collisionManager.hasSDFCache {
+            collisionManager.scheduleRegeneration()
         }
         updateTrackingStateIndicatorIfDirty(sculptingEntity: sculptingEntity)
         guard let rootEntity = rootEntity,
@@ -481,9 +490,14 @@ final class SculptingToolModel {
             sculptingTool.position += shaftResult.correctionVector
         }
 
+        updateDrillTipDebugMarker(position: sculptingTool.position)
+        boneDebrisManager.updateDebrisSpawnPreview(sculptingTool: sculptingTool)
+
+        let drillBitDirection = -shaftDirection
         if let toolComponent = sculptingTool.components[SculptingToolComponent.self] {
             updateAnatomyHazards(toolPosition: sculptingTool.position,
-                                 toolRadius: toolComponent.radius)
+                                 toolRadius: toolComponent.radius,
+                                 drillBitDirection: drillBitDirection)
         }
 
         // Pause carving/tool logic while frozen or recovering.

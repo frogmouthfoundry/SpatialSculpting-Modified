@@ -19,8 +19,14 @@ extension SculptingToolModel {
             buttonSidePrimary?.pressedInput.pressedDidChangeHandler = { _, _, pressed in
                 self.handlePalettePress(pressed: pressed)
             }
-            
-            // Secondary button removed - sculpting is now always active when tracked
+
+            let buttonSideSecondary = input.buttons[.stylusSecondaryButton]
+            buttonSideSecondary?.pressedInput.pressedDidChangeHandler = { _, _, pressed in
+                guard pressed else { return }
+                Task { @MainActor in
+                    self.shouldClearDebris = true
+                }
+            }
         }
         if let haptics = stylus.haptics {
             hapticsModel.setupHaptics(haptics: haptics)

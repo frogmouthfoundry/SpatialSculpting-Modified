@@ -23,8 +23,10 @@ extension SculptingToolModel {
         }
 
         boneSlurryGrid = newGrid
+        newGrid.setSlurryDebugEnabled(isSlurryDebugEnabled)
         if let rootEntity {
             rootEntity.addChild(newGrid.entity)
+            newGrid.setDebugRootEntity(rootEntity)
         }
         sculptingTool.components[SculptingToolComponent.self]?.boneSlurryGrid = newGrid
     }

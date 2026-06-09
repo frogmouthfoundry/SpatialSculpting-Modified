@@ -75,7 +75,9 @@ extension SculptingToolModel {
         }
     }
 
-    func updateAnatomyHazards(toolPosition: SIMD3<Float>, toolRadius: Float) {
+    func updateAnatomyHazards(toolPosition: SIMD3<Float>,
+                              toolRadius: Float,
+                              drillBitDirection: SIMD3<Float>) {
         guard let rootEntity else { return }
 
         var detectedKinds: Set<AnatomyHazardKind> = []
@@ -101,8 +103,10 @@ extension SculptingToolModel {
             case .facialNerve:
                 drillAudioModel?.triggerAlarm(duration: 1.0)
             case .sigmoid:
+                drillAudioModel?.triggerBlood(duration: 1.0)
                 if let position = triggerPoints[hazard] {
-                    triggerBloodSpurt(at: position)
+                    triggerBloodSpurt(at: position,
+                                      direction: drillBitDirection)
                 }
             }
         }
@@ -111,19 +115,22 @@ extension SculptingToolModel {
     private func triggerScreenFlash() {
         hazardFlashTask?.cancel()
         hazardFlashTask = Task { @MainActor in
-            let flashOpacity: Double = 0.52
-            for _ in 0..<3 {
-                self.hazardFlashOpacity = flashOpacity
-                try? await Task.sleep(for: .milliseconds(90))
-                self.hazardFlashOpacity = 0
-                try? await Task.sleep(for: .milliseconds(90))
+            defer {
+                self.setAnatomyHazardFlashActive(false)
+                self.hazardFlashTask = nil
             }
-            self.hazardFlashOpacity = 0
-            self.hazardFlashTask = nil
+            self.setAnatomyHazardFlashActive(true)
+            try? await Task.sleep(for: .milliseconds(500))
+            self.setAnatomyHazardFlashActive(false)
+            try? await Task.sleep(for: .milliseconds(500))
+            self.setAnatomyHazardFlashActive(true)
+            try? await Task.sleep(for: .milliseconds(500))
+            self.setAnatomyHazardFlashActive(false)
         }
     }
 
-    private func triggerBloodSpurt(at rootPosition: SIMD3<Float>) {
+    private func triggerBloodSpurt(at rootPosition: SIMD3<Float>,
+                                   direction: SIMD3<Float>) {
         guard let effectsRoot = anatomyEffectsRoot,
               let bloodSpurtTemplate,
               let rootEntity else {
@@ -133,6 +140,7 @@ extension SculptingToolModel {
         let bloodSpurt = bloodSpurtTemplate.clone(recursive: true)
         bloodSpurt.name = "BloodSpurtEffect"
         bloodSpurt.position = effectsRoot.convert(position: rootPosition, from: rootEntity)
+        bloodSpurt.orientation = safeBloodSpurtOrientation(for: direction)
         effectsRoot.addChild(bloodSpurt)
 
         Task { @MainActor in
@@ -163,5 +171,48 @@ extension SculptingToolModel {
         case 1: return max(extents.x, extents.z)
         default: return max(extents.x, extents.y)
         }
+    }
+
+    private func safeBloodSpurtOrientation(for targetDirection: SIMD3<Float>) -> simd_quatf {
+        let from = SIMD3<Float>(0, 1, 0)
+        let viewerTilt = simd_quatf(angle: .pi / 6, axis: SIMD3<Float>(1, 0, 0))
+        let yawAdjustment = simd_quatf(angle: -.pi / 12, axis: SIMD3<Float>(0, 1, 0))
+        guard targetDirection.x.isFinite,
+              targetDirection.y.isFinite,
+              targetDirection.z.isFinite,
+              simd_length_squared(targetDirection) > 1e-8 else {
+            let fallback = simd_quatf(angle: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))
+            return simd_normalize(fallback * viewerTilt * yawAdjustment)
+        }
+
+        let to = simd_normalize(targetDirection)
+        let dot = simd_dot(from, to)
+        if dot > 0.9999 {
+            let base = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 0, 1))
+            return simd_normalize(base * viewerTilt * yawAdjustment)
+        }
+        if dot < -0.9999 {
+            let base = simd_quatf(angle: .pi, axis: SIMD3<Float>(1, 0, 0))
+            return simd_normalize(base * viewerTilt * yawAdjustment)
+        }
+        let rawAxis = simd_cross(from, to)
+        let axisLengthSquared = simd_length_squared(rawAxis)
+        guard axisLengthSquared > 1e-8,
+              rawAxis.x.isFinite,
+              rawAxis.y.isFinite,
+              rawAxis.z.isFinite else {
+            let fallback = simd_quatf(angle: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))
+            return simd_normalize(fallback * viewerTilt * yawAdjustment)
+        }
+
+        let axis = rawAxis / sqrt(axisLengthSquared)
+        let angle = acos(simd_clamp(dot, -1.0, 1.0))
+        guard angle.isFinite else {
+            let fallback = simd_quatf(angle: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))
+            return simd_normalize(fallback * viewerTilt * yawAdjustment)
+        }
+
+        let baseOrientation = simd_normalize(simd_quatf(angle: angle, axis: axis))
+        return simd_normalize(baseOrientation * viewerTilt * yawAdjustment)
     }
 }

@@ -14,6 +14,11 @@ import QuartzCore
 
 struct ContentView: View {
     var root: Entity = Entity(components: [ComputeSystemComponent(computeSystem: SculptingToolSystem())])
+    @State private var fluidSceneRoot: Entity = {
+        let entity = Entity()
+        entity.name = "FluidSceneRoot"
+        return entity
+    }()
     @State private var staticSceneRoot: Entity = {
         let entity = Entity()
         entity.name = "StaticSceneRoot"
@@ -37,10 +42,12 @@ struct ContentView: View {
     @State private var fluidWaveMesh: AnimatedWaveMesh? = nil
     @State private var fluidWaveEntity: ModelEntity? = nil
     @State private var lastFluidRippleTimestamp: TimeInterval = 0
+    @State private var isFluidLayerHiddenForDebrisReset: Bool = false
     @State private var selectedBitSizeMM: Int = 6
     @State private var didApplyBitSizeToDrillBall: Bool = false
     @State private var didLoadStaticSceneContent: Bool = false
     @State private var didLoadInteractiveAnatomyContent: Bool = false
+    @State private var didQueueDeferredStartupWork: Bool = false
 
     // Volume transparency toggle (50% transparent when on).
     @State private var isVolumeTransparent: Bool = false
@@ -149,9 +156,28 @@ struct ContentView: View {
 
             let entity = ModelEntity(mesh: meshResource, materials: [material])
             entity.name = "FluidLayer"
-            entity.position = SIMD3<Float>(0, -0.22, 0)
-            entity.scale = SIMD3<Float>(0.64, 0.8, 0.64)
-            root.addChild(entity)
+            if let voxelVolume = marchingCubesMesh?.voxelVolume {
+                let dims = SIMD3<Float>(voxelVolume.dimensions)
+                let sculptMin = voxelVolume.voxelStartPosition - voxelVolume.voxelSize * 0.5
+                let sculptMax = voxelVolume.voxelStartPosition + voxelVolume.voxelSize * (dims - 0.5)
+                let sculptExtent = sculptMax - sculptMin
+                entity.position = SIMD3<Float>(
+                    (sculptMin.x + sculptMax.x) * 0.5,
+                    (sculptMin.y + sculptMax.y) * 0.5,
+                    sculptMax.z - 0.15
+                )
+                entity.scale = SIMD3<Float>(
+                    sculptExtent.x * 0.56,
+                    1.0,
+                    sculptExtent.y * 0.56
+                )
+            } else {
+                entity.position = SIMD3<Float>(0, 0, 0.23)
+                entity.scale = SIMD3<Float>(0.448, 1.0, 0.448)
+            }
+            entity.orientation = simd_quatf(angle: .pi / 2, axis: SIMD3<Float>(1, 0, 0))
+            entity.isEnabled = !isFluidLayerHiddenForDebrisReset
+            fluidSceneRoot.addChild(entity)
 
             fluidWaveMesh = waveMesh
             fluidWaveEntity = entity
@@ -162,7 +188,16 @@ struct ContentView: View {
 
     private func updateFluidLayer(timestep: TimeInterval) {
         fluidWaveMesh?.update(timestep)
+        if isFluidLayerHiddenForDebrisReset,
+           sculpting.boneDebrisManager.spawnedDebrisSinceLastClear >= 10 {
+            setFluidLayerVisible(true)
+            isFluidLayerHiddenForDebrisReset = false
+        }
         triggerFluidRippleIfNeeded()
+    }
+
+    private func setFluidLayerVisible(_ isVisible: Bool) {
+        fluidWaveEntity?.isEnabled = isVisible
     }
 
     private var selectedBitRadiusMeters: Float {
@@ -203,15 +238,111 @@ struct ContentView: View {
         guard let waveMesh = fluidWaveMesh, let fluidEntity = fluidWaveEntity else { return }
         let toolPositionInFluidSpace = fluidEntity.convert(position: sculpting.sculptingTool.position, from: root)
         guard abs(toolPositionInFluidSpace.x) < 0.5,
-              abs(toolPositionInFluidSpace.z) < 0.5,
-              abs(toolPositionInFluidSpace.y) < 0.03 else {
+              abs(toolPositionInFluidSpace.y) < 0.5,
+              abs(toolPositionInFluidSpace.z) < 0.03 else {
             return
         }
 
         let now = CACurrentMediaTime()
         guard now - lastFluidRippleTimestamp > 0.07 else { return }
         lastFluidRippleTimestamp = now
-        waveMesh.triggerRipple(at: SIMD2<Float>(toolPositionInFluidSpace.x, toolPositionInFluidSpace.z))
+        waveMesh.triggerRipple(at: SIMD2<Float>(toolPositionInFluidSpace.x, toolPositionInFluidSpace.y))
+    }
+
+    private func ensureBoneSlurryGridIfNeeded() {
+        guard sculpting.boneSlurryGrid == nil,
+              !sculpting.boneDebrisManager.drawnEntities.isEmpty else { return }
+
+        if let voxelVolume = marchingCubesMesh?.voxelVolume {
+            let slurryBounds = slurryBounds(for: voxelVolume)
+            sculpting.replaceBoneSlurryGrid(volumeBoundsMin: slurryBounds.min,
+                                            volumeBoundsMax: slurryBounds.max)
+        } else {
+            sculpting.replaceBoneSlurryGrid()
+        }
+    }
+
+    private func boundsCorners(min: SIMD3<Float>, max: SIMD3<Float>) -> [SIMD3<Float>] {
+        [
+            SIMD3<Float>(min.x, min.y, min.z),
+            SIMD3<Float>(min.x, min.y, max.z),
+            SIMD3<Float>(min.x, max.y, min.z),
+            SIMD3<Float>(min.x, max.y, max.z),
+            SIMD3<Float>(max.x, min.y, min.z),
+            SIMD3<Float>(max.x, min.y, max.z),
+            SIMD3<Float>(max.x, max.y, min.z),
+            SIMD3<Float>(max.x, max.y, max.z)
+        ]
+    }
+
+    private func transformedBounds(corners: [SIMD3<Float>], matrix: simd_float4x4) -> (min: SIMD3<Float>, max: SIMD3<Float>) {
+        var minCorner = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var maxCorner = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+
+        for corner in corners {
+            let transformed = matrix * SIMD4<Float>(corner, 1)
+            let point = SIMD3<Float>(transformed.x, transformed.y, transformed.z)
+            minCorner = simd_min(minCorner, point)
+            maxCorner = simd_max(maxCorner, point)
+        }
+
+        return (minCorner, maxCorner)
+    }
+
+    @MainActor
+    private func queueDeferredStartupWorkIfNeeded() {
+        guard !didQueueDeferredStartupWork else { return }
+        didQueueDeferredStartupWork = true
+
+        Task { @MainActor in
+            await Task.yield()
+            await populateStaticSceneIfNeeded()
+            try? await Task.sleep(for: .milliseconds(100))
+            await populateInteractiveAnatomyIfNeeded()
+            try? await Task.sleep(for: .milliseconds(100))
+            sculpting.preloadBoneDust()
+            sculpting.preloadBloodSpurt()
+        }
+    }
+
+    private func slurryBounds(for voxelVolume: VoxelVolume) -> (min: SIMD3<Float>, max: SIMD3<Float>) {
+        let dims = SIMD3<Float>(voxelVolume.dimensions)
+        let sculptLocalMin = voxelVolume.voxelStartPosition - voxelVolume.voxelSize * 0.5
+        let sculptLocalMax = voxelVolume.voxelStartPosition + voxelVolume.voxelSize * (dims - 0.5)
+
+        // Define the slurry box in the displayed frame after the root's
+        // presentation rotation/scale, then convert it back into root-local
+        // bounds for the slurry grid.
+        let rootMatrix = root.transform.matrix
+        let sculptWorldBounds = transformedBounds(
+            corners: boundsCorners(min: sculptLocalMin, max: sculptLocalMax),
+            matrix: rootMatrix
+        )
+        let sculptWorldExtent = sculptWorldBounds.max - sculptWorldBounds.min
+        let sculptWorldCenterXY = SIMD2<Float>(
+            (sculptWorldBounds.min.x + sculptWorldBounds.max.x) * 0.5,
+            (sculptWorldBounds.min.y + sculptWorldBounds.max.y) * 0.5
+        )
+
+        // Start from the currently reduced slurry size, then enlarge it by 25%.
+        let baseAxisScale = Float(pow(0.25, 1.0 / 3.0)) * 1.25 * 0.5
+        let axisScale = baseAxisScale * 1.25
+        let slurryWorldExtent = sculptWorldExtent * axisScale
+
+        let slurryWorldMinX = sculptWorldCenterXY.x - slurryWorldExtent.x * 0.5
+        let slurryWorldMaxX = sculptWorldCenterXY.x + slurryWorldExtent.x * 0.5
+        let slurryWorldMinY = sculptWorldCenterXY.y - slurryWorldExtent.y * 0.5
+        let slurryWorldMaxY = sculptWorldCenterXY.y + slurryWorldExtent.y * 0.5
+        let slurryWorldMaxZ = sculptWorldBounds.max.z + 0.05
+        let slurryWorldMinZ = slurryWorldMaxZ - slurryWorldExtent.z
+
+        return transformedBounds(
+            corners: boundsCorners(
+                min: SIMD3<Float>(slurryWorldMinX, slurryWorldMinY, slurryWorldMinZ),
+                max: SIMD3<Float>(slurryWorldMaxX, slurryWorldMaxY, slurryWorldMaxZ)
+            ),
+            matrix: rootMatrix.inverse
+        )
     }
 
     @MainActor
@@ -220,7 +351,7 @@ struct ContentView: View {
 
         if let earStructure = try? await Entity(named: "EarStructure") {
             earStructure.scale *= 2.25
-            earStructure.transform.translation += SIMD3(0.09, 0.02, 0.09)
+            earStructure.transform.translation += SIMD3(0.09, 0.02, 0.15)
             staticSceneRoot.addChild(earStructure)
         } else {
             print("Failed to find Ear Structure")
@@ -228,7 +359,7 @@ struct ContentView: View {
 
         if let stagingProps = try? await Entity(named: "Staging") {
             stagingProps.scale *= 1.8
-            stagingProps.transform.translation += SIMD3(0.14, 0, 0.17)
+            stagingProps.transform.translation += SIMD3(0.14, 0, 0.16)
             let rotationQuaternion = simd_quatf(angle: -3.36, axis: SIMD3<Float>(0, 0, 1))
             stagingProps.transform.rotation += rotationQuaternion
             staticSceneRoot.addChild(stagingProps)
@@ -245,7 +376,7 @@ struct ContentView: View {
 
         if let facialNerve = try? await Entity(named: "FacialNerve") {
             facialNerve.scale *= 2.25
-            facialNerve.transform.translation += SIMD3(0.09, 0.02, 0.08)
+            facialNerve.transform.translation += SIMD3(0.09, 0.02, 0.15)
             interactiveAnatomyRoot.addChild(facialNerve)
             sculpting.registerSafezones(for: .facialNerve, entity: facialNerve)
         } else {
@@ -254,7 +385,7 @@ struct ContentView: View {
 
         if let sigmoidSinus = try? await Entity(named: "Sigmoid") {
             sigmoidSinus.scale *= 2.25
-            sigmoidSinus.transform.translation += SIMD3(0.09, 0.02, 0.08)
+            sigmoidSinus.transform.translation += SIMD3(0.09, 0.02, 0.14)
             interactiveAnatomyRoot.addChild(sigmoidSinus)
             sculpting.registerSafezones(for: .sigmoid, entity: sigmoidSinus)
         } else {
@@ -269,13 +400,14 @@ struct ContentView: View {
             // Initialize visionOS bundled reality-material path (if bundled).
             sculpting.prepareBundledSculptMaterialIfNeeded()
 
-            await populateStaticSceneIfNeeded()
-            await populateInteractiveAnatomyIfNeeded()
             if staticSceneRoot.parent == nil {
                 content.add(staticSceneRoot)
             }
             if interactiveAnatomyRoot.parent == nil {
                 content.add(interactiveAnatomyRoot)
+            }
+            if fluidSceneRoot.parent == nil {
+                content.add(fluidSceneRoot)
             }
             sculpting.registerAnatomyEffectsRoot(interactiveAnatomyRoot)
 
@@ -302,9 +434,7 @@ struct ContentView: View {
             if let slurryEntity = sculpting.boneSlurryGrid?.entity {
                 root.addChild(slurryEntity)
             }
-
-            // Add animated fluid layer mesh.
-            createFluidLayerIfNeeded()
+            sculpting.boneSlurryGrid?.setDebugRootEntity(root)
 
             content.add(root)
             sculpting.rootEntity = root
@@ -312,33 +442,29 @@ struct ContentView: View {
             // Set up the bone debris manager with the root entity and SDF access.
             if let voxelVolume = marchingCubesMesh?.voxelVolume {
                 sculpting.boneDebrisManager.setup(rootEntity: root, voxelVolume: voxelVolume)
-                // Lock slurry grid to the same bounds as the sculpting volume.
-                let dims = SIMD3<Float>(voxelVolume.dimensions)
-                let bMin = voxelVolume.voxelStartPosition - voxelVolume.voxelSize * 0.5
-                let bMax = voxelVolume.voxelStartPosition + voxelVolume.voxelSize * (dims - 0.5)
-                sculpting.boneSlurryGrid?.configure(volumeBoundsMin: bMin, volumeBoundsMax: bMax)
             } else {
                 sculpting.boneDebrisManager.setup(rootEntity: root)
             }
-
-            // Pre-load bone dust particle template to avoid disk I/O during sculpting.
-            sculpting.preloadBoneDust()
-            sculpting.preloadBloodSpurt()
 
             // Set up the collision manager with direct SDF access.
             if let voxelVolume = marchingCubesMesh?.voxelVolume {
                 sculpting.collisionManager.setup(rootEntity: root, voxelVolume: voxelVolume)
             }
-            // Schedule initial collision generation (delay for GPU to render first mesh).
-            sculpting.collisionManager.scheduleRegeneration()
 
             // Update sculpting tool and check for tracking quality each frame.
             _ = content.subscribe(to: SceneEvents.Update.self) {
                 event in
+                queueDeferredStartupWorkIfNeeded()
+                if sculpting.shouldClearDebris {
+                    sculpting.shouldClearDebris = false
+                    handleClearDebris()
+                }
                 if sculpting.drillBallEntity != nil, !didApplyBitSizeToDrillBall {
                     applySelectedBitSize()
                 }
+                ensureBoneSlurryGridIfNeeded()
                 sculpting.updateSculptingTool()
+                createFluidLayerIfNeeded()
                 updateFluidLayer(timestep: event.deltaTime)
             }
 
@@ -422,14 +548,18 @@ struct ContentView: View {
                 // Load a packaged sculpt volume from app bundle.
                 try sculpting.loadBundledPackage(named: "MyVolume")
                 applyLoadedVolumePresentationTransform()
-                sculpting.collisionManager.scheduleRegeneration()
+                if sculpting.sculptingEntity != nil {
+                    sculpting.collisionManager.scheduleRegeneration()
+                }
             } catch {
                 // Fallback to legacy .volume file.
                 if let url = Bundle.main.url(forResource: "MyModel", withExtension: "volume") {
                     do {
                         try sculpting.loadFromURL(url)
                         applyLoadedVolumePresentationTransform()
-                        sculpting.collisionManager.scheduleRegeneration()
+                        if sculpting.sculptingEntity != nil {
+                            sculpting.collisionManager.scheduleRegeneration()
+                        }
                     } catch {
                         print("Failed to open document: \(error)")
                     }
@@ -458,7 +588,9 @@ struct ContentView: View {
     func clearButton() -> some View {
         Button {
             sculpting.sculptingTool.components[SculptingToolComponent.self]?.clear = true
-            sculpting.collisionManager.scheduleRegeneration()
+            if sculpting.sculptingEntity != nil {
+                sculpting.collisionManager.scheduleRegeneration()
+            }
         } label: {
             Text("Clear")
         }
@@ -467,7 +599,9 @@ struct ContentView: View {
     func resetButton() -> some View {
         Button {
             sculpting.sculptingTool.components[SculptingToolComponent.self]?.reset = true
-            sculpting.collisionManager.scheduleRegeneration()
+            if sculpting.sculptingEntity != nil {
+                sculpting.collisionManager.scheduleRegeneration()
+            }
         } label: {
             Text("Reset")
         }
@@ -483,19 +617,43 @@ struct ContentView: View {
 
     func clearDebrisButton() -> some View {
         Button {
-            sculpting.boneDebrisManager.clearAllDebris()
-            sculpting.sculptingTool.components[SculptingToolComponent.self]?.previousPosition = nil
-
-            if let voxelVolume = marchingCubesMesh?.voxelVolume {
-                let dims = SIMD3<Float>(voxelVolume.dimensions)
-                let bMin = voxelVolume.voxelStartPosition - voxelVolume.voxelSize * 0.5
-                let bMax = voxelVolume.voxelStartPosition + voxelVolume.voxelSize * (dims - 0.5)
-                sculpting.replaceBoneSlurryGrid(volumeBoundsMin: bMin, volumeBoundsMax: bMax)
-            } else {
-                sculpting.replaceBoneSlurryGrid()
-            }
+            handleClearDebris()
         } label: {
             Text("Clear Debris")
+        }
+    }
+
+    private func setSlurryDebugEnabled(_ isEnabled: Bool) {
+        sculpting.isSlurryDebugEnabled = isEnabled
+        sculpting.boneDebrisManager.setSlurryDebugEnabled(isEnabled)
+        sculpting.boneSlurryGrid?.setSlurryDebugEnabled(isEnabled)
+        if !isEnabled {
+            sculpting.drillTipDebugMarker?.isEnabled = false
+        }
+    }
+
+    func slurryDebugButton() -> some View {
+        Button {
+            setSlurryDebugEnabled(!sculpting.isSlurryDebugEnabled)
+        } label: {
+            Text(sculpting.isSlurryDebugEnabled ? "Slurry Debug ON" : "Slurry Debug Off")
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(sculpting.isSlurryDebugEnabled ? .green : .gray)
+    }
+
+    private func handleClearDebris() {
+        sculpting.boneDebrisManager.clearAllDebris()
+        sculpting.sculptingTool.components[SculptingToolComponent.self]?.previousPosition = nil
+        setFluidLayerVisible(false)
+        isFluidLayerHiddenForDebrisReset = true
+
+        if let voxelVolume = marchingCubesMesh?.voxelVolume {
+            let slurryBounds = slurryBounds(for: voxelVolume)
+            sculpting.replaceBoneSlurryGrid(volumeBoundsMin: slurryBounds.min,
+                                            volumeBoundsMax: slurryBounds.max)
+        } else {
+            sculpting.replaceBoneSlurryGrid()
         }
     }
 
@@ -609,6 +767,7 @@ struct ContentView: View {
                         HStack {
                             openButton()
                             clearDebrisButton()
+                            slurryDebugButton()
                         }
                         HStack {
                             rotateXButton()
@@ -632,10 +791,6 @@ struct ContentView: View {
                     }.padding().glassBackgroundEffect()
                 }
             //end Sculpting Volume
-            Color.red
-                .opacity(sculpting.hazardFlashOpacity)
-                .ignoresSafeArea()
-                .allowsHitTesting(false)
         }
     }
 }

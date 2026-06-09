@@ -46,4 +46,30 @@ extension DrillAudioModel {
             self.pendingAlarmStopTask = nil
         }
     }
+
+    func triggerBlood(duration: TimeInterval = 1.0) {
+        pendingBloodStopTask?.cancel()
+        pendingBloodStopTask = nil
+
+        guard let alarmEmitterEntity,
+              let bloodResource else {
+            print("[DrillAudio] Blood audio requested before emitter/resource attach")
+            return
+        }
+
+        bloodController?.stop()
+        let controller = alarmEmitterEntity.playAudio(bloodResource)
+        controller.gain = 10
+        bloodController = controller
+        print("[DrillAudio] Triggered blood audio")
+
+        pendingBloodStopTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(Int(duration * 1000)))
+            controller.stop()
+            if self.bloodController === controller {
+                self.bloodController = nil
+            }
+            self.pendingBloodStopTask = nil
+        }
+    }
 }

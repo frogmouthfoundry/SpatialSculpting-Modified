@@ -26,6 +26,14 @@ import RealityKit
 
 extension SculptingToolModel {
 
+    private var shaftCollisionWarningUIColor: UIColor {
+        UIColor(red: 1.0, green: 0.76, blue: 0.18, alpha: 1.0)
+    }
+
+    private var anatomyHazardFlashUIColor: UIColor {
+        .red
+    }
+
     // MARK: - Drill Shaft Collision Visual Feedback
 
     /// Walk the drill model entity tree and cache every ModelComponent's materials.
@@ -48,15 +56,16 @@ extension SculptingToolModel {
         _cachedDrillMaterials = cache
     }
 
-    /// Tint the entire drill model red to indicate shaft collision.
+    /// Tint the entire drill model orange-yellow to indicate shaft collision.
     func tintDrillRed() {
+        isShaftCollisionWarningActive = true
         guard !_isDrillTintedRed else { return }
         _isDrillTintedRed = true
-        let redMaterial = SimpleMaterial(color: .red, roughness: 0.3, isMetallic: false)
+        let warningMaterial = SimpleMaterial(color: shaftCollisionWarningUIColor, roughness: 0.3, isMetallic: false)
         if let drillModel = drillModelEntity {
             func walk(_ entity: Entity) {
                 if var model = entity.components[ModelComponent.self] {
-                    model.materials = Array(repeating: redMaterial, count: model.materials.count)
+                    model.materials = Array(repeating: warningMaterial, count: model.materials.count)
                     entity.components.set(model)
                 }
                 for child in entity.children {
@@ -66,7 +75,7 @@ extension SculptingToolModel {
             walk(drillModel)
         }
         if var ballModel = drillBallEntity?.components[ModelComponent.self] {
-            ballModel.materials = Array(repeating: redMaterial, count: ballModel.materials.count)
+            ballModel.materials = Array(repeating: warningMaterial, count: ballModel.materials.count)
             if let drillBall = drillBallEntity {
                 drillBall.components.set(ballModel)
             }
@@ -75,6 +84,7 @@ extension SculptingToolModel {
 
     /// Restore original drill materials after shaft collision clears.
     func restoreDrillMaterials() {
+        isShaftCollisionWarningActive = false
         guard _isDrillTintedRed else { return }
         _isDrillTintedRed = false
         for (entity, materials) in _cachedDrillMaterials {
@@ -85,34 +95,63 @@ extension SculptingToolModel {
         }
     }
 
-    /// Tint all sculpt mesh chunks red in sync with shaft-collision drill tint.
+    /// Tint all sculpt mesh chunks to the current warning state.
     func tintSculptMeshRed() {
-        guard !_isSculptMeshTintedRed else { return }
-        guard let root = rootEntity else { return }
-
-        _cachedSculptMeshMaterials.removeAll()
-        let redMaterial = SimpleMaterial(color: .red, roughness: 0.3, isMetallic: false)
-        for child in root.children where child.name == "SculptMeshChunk" {
-            if var model = child.components[ModelComponent.self] {
-                _cachedSculptMeshMaterials.append((child, model.materials))
-                model.materials = Array(repeating: redMaterial, count: max(model.materials.count, 1))
-                child.components.set(model)
-            }
-        }
-        _isSculptMeshTintedRed = true
+        isShaftCollisionWarningActive = true
+        applySculptMeshWarningAppearance()
     }
 
     /// Restore original sculpt mesh chunk materials after collision clears.
     func restoreSculptMeshMaterials() {
-        guard _isSculptMeshTintedRed else { return }
-        _isSculptMeshTintedRed = false
+        isShaftCollisionWarningActive = false
+        applySculptMeshWarningAppearance()
+    }
+
+    func setAnatomyHazardFlashActive(_ isActive: Bool) {
+        isAnatomyHazardFlashActive = isActive
+        applySculptMeshWarningAppearance()
+    }
+
+    private func applySculptMeshWarningAppearance() {
+        guard let root = rootEntity else { return }
+
+        if _cachedSculptMeshMaterials.isEmpty {
+            for child in root.children where child.name == "SculptMeshChunk" {
+                if let model = child.components[ModelComponent.self] {
+                    _cachedSculptMeshMaterials.append((child, model.materials))
+                }
+            }
+        }
+
+        let desiredColor: UIColor?
+        if isAnatomyHazardFlashActive {
+            desiredColor = anatomyHazardFlashUIColor
+        } else if isShaftCollisionWarningActive {
+            desiredColor = shaftCollisionWarningUIColor
+        } else {
+            desiredColor = nil
+        }
+
+        guard let desiredColor else {
+            guard _isSculptMeshTintedRed else { return }
+            _isSculptMeshTintedRed = false
+            for (entity, materials) in _cachedSculptMeshMaterials {
+                if var model = entity.components[ModelComponent.self] {
+                    model.materials = materials
+                    entity.components.set(model)
+                }
+            }
+            return
+        }
+
+        let warningMaterial = SimpleMaterial(color: desiredColor, roughness: 0.3, isMetallic: false)
         for (entity, materials) in _cachedSculptMeshMaterials {
             if var model = entity.components[ModelComponent.self] {
-                model.materials = materials
+                model.materials = Array(repeating: warningMaterial, count: max(materials.count, 1))
                 entity.components.set(model)
             }
         }
-        _cachedSculptMeshMaterials.removeAll()
+        _isSculptMeshTintedRed = true
     }
 
     /// Show the current cylindrical shaft detector zone in root space.
@@ -154,6 +193,25 @@ extension SculptingToolModel {
 
     func hideShaftCollisionDebugMarker() {
         shaftCollisionDebugMarker?.isEnabled = false
+    }
+
+    func updateDrillTipDebugMarker(position: SIMD3<Float>) {
+        guard isSlurryDebugEnabled else {
+            drillTipDebugMarker?.isEnabled = false
+            return
+        }
+        guard let root = rootEntity else { return }
+        if drillTipDebugMarker == nil {
+            let marker = ModelEntity(
+                mesh: .generateSphere(radius: 0.0025),
+                materials: [SimpleMaterial(color: .green.withAlphaComponent(0.9), roughness: 0.1, isMetallic: false)]
+            )
+            marker.name = "DrillTipDebugMarker"
+            root.addChild(marker)
+            drillTipDebugMarker = marker
+        }
+        drillTipDebugMarker?.position = position
+        drillTipDebugMarker?.isEnabled = true
     }
 
     // Add a visual tooltip to indicate where sculpting occurs.

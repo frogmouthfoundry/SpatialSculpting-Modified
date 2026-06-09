@@ -1,6 +1,6 @@
 /*
 Abstract:
-Manages a 64^3 density grid locked to the sculpting volume bounds.
+Manages a slurry density grid locked to a reduced region inside the sculpting volume bounds.
 Bone debris particles are splatted into the grid as anisotropic
 metaballs, then a secondary marching cubes pass extracts a unified
 mesh with a wet PBR material.
@@ -22,7 +22,7 @@ final class BoneSlurryGrid {
 
     // MARK: - Grid Constants
 
-    static let gridDimension: UInt32 = 128
+    static let gridDimension: UInt32 = 64
 
     /// Maximum number of vertices the bone slurry mesh can hold.
     private let maxVertexCapacity: Int = 300_000
@@ -45,6 +45,8 @@ final class BoneSlurryGrid {
     private var volumeConfigured: Bool = false
     private var volumeBoundsMin: SIMD3<Float> = .zero
     private var volumeBoundsMax: SIMD3<Float> = .zero
+    private var gridOriginInRoot: SIMD3<Float> = .zero
+    private let particleBoundsMargin: Float = 0.02
 
     // MARK: - Metal Resources
 
@@ -88,10 +90,15 @@ final class BoneSlurryGrid {
     private var lastParticleSignature: UInt64 = 0
     private var lastUploadedParticleCount: UInt32 = 0
     private var lastExtractedIsoValue: Float = .greatestFiniteMagnitude
+    private var isMeshHiddenForEmptyState: Bool = true
 
     // MARK: - Debug
 
     private var debugFrameCounter: Int = 0
+    /// Temporary debug visual for the slurry-grid bounds.
+    private var slurryBoundsDebugMarker: ModelEntity?
+    private weak var debugRootEntity: Entity?
+    private var isSlurryDebugEnabled: Bool = false
 
     // MARK: - Init
 
@@ -102,7 +109,7 @@ final class BoneSlurryGrid {
         }
 
         let dim = Self.gridDimension
-        let totalVoxelCount = dim * dim * dim  // 262,144
+        let totalVoxelCount = dim * dim * dim  // 64^3 = 262,144
         self.totalVoxels = totalVoxelCount
 
         // --- Metal Buffers ---
@@ -241,23 +248,79 @@ final class BoneSlurryGrid {
     func configure(volumeBoundsMin: SIMD3<Float>, volumeBoundsMax: SIMD3<Float>) {
         self.volumeBoundsMin = volumeBoundsMin
         self.volumeBoundsMax = volumeBoundsMax
+        self.gridOriginInRoot = volumeBoundsMin
         self.volumeConfigured = true
 
         let extent = volumeBoundsMax - volumeBoundsMin
         let dim = Float(Self.gridDimension)
         params.gridOrigin = volumeBoundsMin
         params.voxelSize = extent / dim
+        entity.position = .zero
+        updateSlurryBoundsDebugMarker(volumeBoundsMin: volumeBoundsMin,
+                                      volumeBoundsMax: volumeBoundsMax)
 
         print("[BoneSlurryGrid] Configured: bounds=\(volumeBoundsMin)...\(volumeBoundsMax), voxelSize=\(params.voxelSize)")
+    }
+
+    /// Debug-only root used so the bounds marker stays visible even when the
+    /// slurry mesh entity itself is hidden.
+    func setDebugRootEntity(_ rootEntity: Entity?) {
+        debugRootEntity = rootEntity
+        if let marker = slurryBoundsDebugMarker,
+           let rootEntity,
+           marker.parent !== rootEntity {
+            marker.removeFromParent()
+            rootEntity.addChild(marker)
+        }
+        slurryBoundsDebugMarker?.isEnabled = isSlurryDebugEnabled
+    }
+
+    func setSlurryDebugEnabled(_ isEnabled: Bool) {
+        isSlurryDebugEnabled = isEnabled
+        if isEnabled, volumeConfigured {
+            updateSlurryBoundsDebugMarker(volumeBoundsMin: volumeBoundsMin,
+                                          volumeBoundsMax: volumeBoundsMax)
+        } else {
+            slurryBoundsDebugMarker?.isEnabled = false
+        }
+    }
+
+    private func updateSlurryBoundsDebugMarker(volumeBoundsMin: SIMD3<Float>,
+                                               volumeBoundsMax: SIMD3<Float>) {
+        guard isSlurryDebugEnabled else {
+            slurryBoundsDebugMarker?.isEnabled = false
+            return
+        }
+        let extent = max(volumeBoundsMax - volumeBoundsMin, SIMD3<Float>(repeating: 0.0005))
+        let center = (volumeBoundsMin + volumeBoundsMax) * 0.5
+        if slurryBoundsDebugMarker == nil {
+            let marker = ModelEntity(
+                mesh: .generateBox(size: extent),
+                materials: [SimpleMaterial(color: .cyan.withAlphaComponent(0.12), roughness: 0.1, isMetallic: false)]
+            )
+            marker.name = "SlurryBoundsDebugMarker"
+            if let debugRootEntity {
+                debugRootEntity.addChild(marker)
+            } else {
+                entity.addChild(marker)
+            }
+            slurryBoundsDebugMarker = marker
+        } else if var model = slurryBoundsDebugMarker?.components[ModelComponent.self] {
+            model.mesh = .generateBox(size: extent)
+            slurryBoundsDebugMarker?.components.set(model)
+        }
+        slurryBoundsDebugMarker?.position = center
+        slurryBoundsDebugMarker?.isEnabled = true
     }
 
     // MARK: - Per-Frame Particle Upload (CPU → GPU)
 
     /// Reads debris entity transforms and uploads them to the particle buffer.
-    /// Grid origin/voxelSize are fixed to the sculpting volume — only particles
-    /// within bounds are uploaded. Scale comes from the growth multiplier
-    /// dictionary (not the entity transform, which physics overwrites).
-    /// Debris younger than spawnVisibilityDelay is excluded.
+    /// Particle positions stay in root-local space so the GPU emits slurry
+    /// vertices in the same coordinate space as the sculpt volume and drill.
+    /// Scale comes from the growth multiplier dictionary (not the entity
+    /// transform, which physics overwrites). Debris younger than
+    /// spawnVisibilityDelay is excluded.
     func uploadParticles(from debrisManager: BoneDebrisManager,
                          rootEntity: Entity) {
         let now = CACurrentMediaTime()
@@ -291,8 +354,12 @@ final class BoneSlurryGrid {
             let pos = modelEntity.position(relativeTo: rootEntity)
 
             // Skip particles outside the volume bounds.
-            if pos.x < volumeBoundsMin.x || pos.y < volumeBoundsMin.y || pos.z < volumeBoundsMin.z ||
-               pos.x > volumeBoundsMax.x || pos.y > volumeBoundsMax.y || pos.z > volumeBoundsMax.z {
+            if pos.x < (volumeBoundsMin.x - particleBoundsMargin) ||
+               pos.y < (volumeBoundsMin.y - particleBoundsMargin) ||
+               pos.z < (volumeBoundsMin.z - particleBoundsMargin) ||
+               pos.x > (volumeBoundsMax.x + particleBoundsMargin) ||
+               pos.y > (volumeBoundsMax.y + particleBoundsMargin) ||
+               pos.z > (volumeBoundsMax.z + particleBoundsMargin) {
                 continue
             }
 
@@ -346,6 +413,7 @@ final class BoneSlurryGrid {
         meshNeedsExtraction = false
         rebuildMesh(indexCount: 0)
         entity.isEnabled = false
+        isMeshHiddenForEmptyState = true
     }
 
     // MARK: - GPU Dispatch (called from ComputeSystem)
@@ -353,8 +421,13 @@ final class BoneSlurryGrid {
     func update(computeContext: inout ComputeUpdateContext) {
         let now = CACurrentMediaTime()
         guard params.particleCount > 0 else {
-            rebuildMesh(indexCount: 0)
-            entity.isEnabled = false
+            // Do not rebuild the LowLevelMesh every empty frame. That causes
+            // heavy RealityKit/Metal churn during launch and after load, when
+            // the slurry often has zero particles for extended periods.
+            if !isMeshHiddenForEmptyState {
+                entity.isEnabled = false
+                isMeshHiddenForEmptyState = true
+            }
             return
         }
         guard meshNeedsExtraction,
@@ -363,6 +436,7 @@ final class BoneSlurryGrid {
         guard let computeEncoder = computeContext.computeEncoder() else { return }
         mesh.parts.replaceAll([LowLevelMesh.Part(indexCount: maxVertexCapacity, bounds: meshBounds)])
         entity.isEnabled = true
+        isMeshHiddenForEmptyState = false
         lastMeshExtractionTime = now
         meshNeedsExtraction = false
         lastExtractedIsoValue = params.isoValue

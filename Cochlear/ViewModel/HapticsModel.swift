@@ -11,22 +11,22 @@ import CoreHaptics
 @MainActor @Observable
 final class HapticsModel {
 
-    var hapticEngine: CHHapticEngine? = nil
+    @ObservationIgnored var hapticEngine: CHHapticEngine? = nil
 
     // Idle drill vibration
-    var idlePattern: CHHapticPattern? = nil
-    var idlePlayer: CHHapticPatternPlayer? = nil
-    var isIdlePlaying: Bool = false
+    @ObservationIgnored var idlePattern: CHHapticPattern? = nil
+    @ObservationIgnored var idlePlayer: CHHapticPatternPlayer? = nil
+    @ObservationIgnored var isIdlePlaying: Bool = false
 
     // Intense sculpting vibration
-    var sculptPattern: CHHapticPattern? = nil
-    var sculptPlayer: CHHapticPatternPlayer? = nil
-    var isSculptPlaying: Bool = false
+    @ObservationIgnored var sculptPattern: CHHapticPattern? = nil
+    @ObservationIgnored var sculptPlayer: CHHapticPatternPlayer? = nil
+    @ObservationIgnored var isSculptPlaying: Bool = false
 
     // Shaft collision warning pulse
-    var shaftCollisionPattern: CHHapticPattern? = nil
-    var shaftCollisionPlayer: CHHapticPatternPlayer? = nil
-    var isShaftCollisionPlaying: Bool = false
+    @ObservationIgnored var shaftCollisionPattern: CHHapticPattern? = nil
+    @ObservationIgnored var shaftCollisionPlayer: CHHapticPatternPlayer? = nil
+    @ObservationIgnored var isShaftCollisionPlaying: Bool = false
 
     func ensureEngineRunning() {
         try? hapticEngine?.start()
