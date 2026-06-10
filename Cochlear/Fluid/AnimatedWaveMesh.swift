@@ -36,6 +36,10 @@ final class AnimatedWaveMesh {
     private var touchEnd: SIMD2<Float> = .zero
     private var rippleTime: Float = 0.0
 
+    var needsFrameUpdate: Bool {
+        needsTopologyUpdate || amplitude != 0 || ripplePoint != nil
+    }
+
     init() throws {
         guard metalDevice != nil else { throw Error.missingMetalDevice }
         guard let queue = makeCommandQueue(labeled: "Animated Wave Mesh Queue") else {

@@ -17,6 +17,11 @@ import Metal
 import UIKit
 import QuartzCore
 
+enum BoneSlurryPerformanceTier: Equatable {
+    case normal
+    case zoomed
+}
+
 @MainActor
 final class BoneSlurryGrid {
 
@@ -66,31 +71,31 @@ final class BoneSlurryGrid {
 
     private let totalVoxels: UInt32
 
-    private let clearMeshThreadgroups: MTLSize
     private let clearMeshThreadsPerThreadgroup: MTLSize
     private let clearDensityThreadgroups: MTLSize
     private let clearDensityThreadsPerThreadgroup: MTLSize
-    private let marchThreadgroups: MTLSize
     private let marchThreadsPerThreadgroup: MTLSize
 
     // MARK: - Output Mesh
 
     var mesh: LowLevelMesh
     let entity: ModelEntity
-    private let meshBounds: BoundingBox
+    private var meshBounds: BoundingBox
 
     // MARK: - State
 
     private var params: BoneSlurryGridParams
     private let uploadInterval: TimeInterval = 1.0 / 30.0
     private var lastUploadTime: TimeInterval = 0
-    private let meshExtractionInterval: TimeInterval = 1.0 / 12.0
+    private var meshExtractionInterval: TimeInterval = 1.0 / 12.0
     private var lastMeshExtractionTime: TimeInterval = 0
     private var meshNeedsExtraction: Bool = false
     private var lastParticleSignature: UInt64 = 0
     private var lastUploadedParticleCount: UInt32 = 0
     private var lastExtractedIsoValue: Float = .greatestFiniteMagnitude
     private var isMeshHiddenForEmptyState: Bool = true
+    private var activeMaxVertexCount: Int = 300_000
+    private var performanceTier: BoneSlurryPerformanceTier = .normal
 
     // MARK: - Debug
 
@@ -174,11 +179,6 @@ final class BoneSlurryGrid {
         let maxVerts = maxVertexCapacity
 
         let clearMeshTpTg = MTLSize(width: 512, height: 1, depth: 1)
-        let clearMeshTg = MTLSize(
-            width: (maxVerts + clearMeshTpTg.width - 1) / clearMeshTpTg.width,
-            height: 1, depth: 1
-        )
-        self.clearMeshThreadgroups = clearMeshTg
         self.clearMeshThreadsPerThreadgroup = clearMeshTpTg
 
         let clearDensTpTg = MTLSize(width: 512, height: 1, depth: 1)
@@ -190,13 +190,6 @@ final class BoneSlurryGrid {
         self.clearDensityThreadsPerThreadgroup = clearDensTpTg
 
         let marchTpTg = MTLSize(width: 4, height: 4, depth: 4)
-        let cubes = Int(dim - 1)
-        let marchTg = MTLSize(
-            width: (cubes + marchTpTg.width - 1) / marchTpTg.width,
-            height: (cubes + marchTpTg.height - 1) / marchTpTg.height,
-            depth: (cubes + marchTpTg.depth - 1) / marchTpTg.depth
-        )
-        self.marchThreadgroups = marchTg
         self.marchThreadsPerThreadgroup = marchTpTg
 
         // --- LowLevelMesh ---
@@ -239,6 +232,8 @@ final class BoneSlurryGrid {
             isoValue: isoValue
         )
 
+        self.activeMaxVertexCount = maxVerts
+
         print("[BoneSlurryGrid] Initialized: \(dim)^3 grid, maxVerts=\(maxVerts)")
     }
 
@@ -255,11 +250,29 @@ final class BoneSlurryGrid {
         let dim = Float(Self.gridDimension)
         params.gridOrigin = volumeBoundsMin
         params.voxelSize = extent / dim
+        params.maxVertexCount = UInt32(activeMaxVertexCount)
         entity.position = .zero
+        updateMeshBounds(min: volumeBoundsMin, max: volumeBoundsMax)
         updateSlurryBoundsDebugMarker(volumeBoundsMin: volumeBoundsMin,
                                       volumeBoundsMax: volumeBoundsMax)
 
         print("[BoneSlurryGrid] Configured: bounds=\(volumeBoundsMin)...\(volumeBoundsMax), voxelSize=\(params.voxelSize)")
+    }
+
+    func setPerformanceTier(_ tier: BoneSlurryPerformanceTier) {
+        guard performanceTier != tier else { return }
+        performanceTier = tier
+        switch tier {
+        case .normal:
+            meshExtractionInterval = 1.0 / 12.0
+            activeMaxVertexCount = maxVertexCapacity
+        case .zoomed:
+            meshExtractionInterval = 1.0 / 8.0
+            activeMaxVertexCount = 180_000
+        }
+        params.maxVertexCount = UInt32(activeMaxVertexCount)
+        meshNeedsExtraction = true
+        lastMeshExtractionTime = 0
     }
 
     /// Debug-only root used so the bounds marker stays visible even when the
@@ -406,6 +419,7 @@ final class BoneSlurryGrid {
 
     func clearAllParticlesAndMesh() {
         params.particleCount = 0
+        params.maxVertexCount = UInt32(activeMaxVertexCount)
         lastUploadedParticleCount = 0
         lastParticleSignature = 0
         lastExtractedIsoValue = .greatestFiniteMagnitude
@@ -434,7 +448,8 @@ final class BoneSlurryGrid {
               now - lastMeshExtractionTime >= meshExtractionInterval else { return }
 
         guard let computeEncoder = computeContext.computeEncoder() else { return }
-        mesh.parts.replaceAll([LowLevelMesh.Part(indexCount: maxVertexCapacity, bounds: meshBounds)])
+        params.maxVertexCount = UInt32(activeMaxVertexCount)
+        mesh.parts.replaceAll([LowLevelMesh.Part(indexCount: activeMaxVertexCount, bounds: meshBounds)])
         entity.isEnabled = true
         isMeshHiddenForEmptyState = false
         lastMeshExtractionTime = now
@@ -445,12 +460,13 @@ final class BoneSlurryGrid {
         let indexBuffer = mesh.replaceIndices(using: computeContext.commandBuffer)
 
         // 1. Clear mesh
-        var maxVerts = UInt32(maxVertexCapacity)
+        var maxVerts = UInt32(activeMaxVertexCount)
         computeEncoder.setComputePipelineState(clearMeshPipeline)
         computeEncoder.setBuffer(vertexBuffer, offset: 0, index: 0)
         computeEncoder.setBuffer(indexBuffer, offset: 0, index: 1)
         computeEncoder.setBytes(&maxVerts, length: MemoryLayout<UInt32>.stride, index: 2)
-        computeEncoder.dispatchThreadgroups(clearMeshThreadgroups, threadsPerThreadgroup: clearMeshThreadsPerThreadgroup)
+        computeEncoder.dispatchThreadgroups(clearMeshThreadgroups(for: activeMaxVertexCount),
+                                            threadsPerThreadgroup: clearMeshThreadsPerThreadgroup)
 
         // 2. Clear density
         var totalCount = totalVoxels
@@ -487,7 +503,8 @@ final class BoneSlurryGrid {
         computeEncoder.setBytes(&params, length: MemoryLayout<BoneSlurryGridParams>.stride, index: 3)
         computeEncoder.setBuffer(triangleTableBuffer, offset: 0, index: 4)
         computeEncoder.setBuffer(counterBuffer, offset: 0, index: 5)
-        computeEncoder.dispatchThreadgroups(marchThreadgroups, threadsPerThreadgroup: marchThreadsPerThreadgroup)
+        computeEncoder.dispatchThreadgroups(marchThreadgroups(),
+                                            threadsPerThreadgroup: marchThreadsPerThreadgroup)
 
         // Periodic telemetry
         let shouldLog = false
@@ -562,5 +579,28 @@ final class BoneSlurryGrid {
     private func mixHash(_ hash: UInt64, _ value: UInt64) -> UInt64 {
         let prime: UInt64 = 1099511628211
         return (hash ^ value) &* prime
+    }
+
+    private func clearMeshThreadgroups(for maxVertices: Int) -> MTLSize {
+        MTLSize(
+            width: (maxVertices + clearMeshThreadsPerThreadgroup.width - 1) / clearMeshThreadsPerThreadgroup.width,
+            height: 1,
+            depth: 1
+        )
+    }
+
+    private func marchThreadgroups() -> MTLSize {
+        let cubes = Int(Self.gridDimension - 1)
+        return MTLSize(
+            width: (cubes + marchThreadsPerThreadgroup.width - 1) / marchThreadsPerThreadgroup.width,
+            height: (cubes + marchThreadsPerThreadgroup.height - 1) / marchThreadsPerThreadgroup.height,
+            depth: (cubes + marchThreadsPerThreadgroup.depth - 1) / marchThreadsPerThreadgroup.depth
+        )
+    }
+
+    private func updateMeshBounds(min: SIMD3<Float>, max: SIMD3<Float>) {
+        let padding = params.voxelSize + SIMD3<Float>(repeating: 0.01)
+        meshBounds = BoundingBox(min: min - padding, max: max + padding)
+        mesh.parts.replaceAll([LowLevelMesh.Part(indexCount: activeMaxVertexCount, bounds: meshBounds)])
     }
 }

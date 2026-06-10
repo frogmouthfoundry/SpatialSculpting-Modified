@@ -34,6 +34,7 @@ extension SculptingToolModel {
     }
 
     func registerSafezones(for kind: AnatomyHazardKind, entity: Entity) {
+        anatomyHazardEntities[kind] = entity
         let bounds = entity.visualBounds(relativeTo: entity)
         let extents = bounds.extents
         let center = bounds.center
@@ -98,7 +99,7 @@ extension SculptingToolModel {
         activeAnatomyHazards = detectedKinds
 
         for hazard in newHazards {
-            triggerScreenFlash()
+            triggerScreenFlash(for: Set([hazard]))
             switch hazard {
             case .facialNerve:
                 drillAudioModel?.triggerAlarm(duration: 1.0)
@@ -112,13 +113,15 @@ extension SculptingToolModel {
         }
     }
 
-    private func triggerScreenFlash() {
+    private func triggerScreenFlash(for kinds: Set<AnatomyHazardKind>) {
         hazardFlashTask?.cancel()
         hazardFlashTask = Task { @MainActor in
             defer {
+                self.flashingAnatomyHazards = []
                 self.setAnatomyHazardFlashActive(false)
                 self.hazardFlashTask = nil
             }
+            self.flashingAnatomyHazards = kinds
             self.setAnatomyHazardFlashActive(true)
             try? await Task.sleep(for: .milliseconds(500))
             self.setAnatomyHazardFlashActive(false)
@@ -126,6 +129,23 @@ extension SculptingToolModel {
             self.setAnatomyHazardFlashActive(true)
             try? await Task.sleep(for: .milliseconds(500))
             self.setAnatomyHazardFlashActive(false)
+        }
+    }
+
+    func applyAnatomyHazardWarningAppearance() {
+        let warningMaterial = SimpleMaterial(color: .red, roughness: 0.3, isMetallic: false)
+
+        for (kind, entity) in anatomyHazardEntities {
+            let shouldFlash = isAnatomyHazardFlashActive && flashingAnatomyHazards.contains(kind)
+            if shouldFlash {
+                if cachedAnatomyHazardMaterials[kind] == nil {
+                    cachedAnatomyHazardMaterials[kind] = cachedMaterials(for: entity)
+                }
+                applyMaterial(warningMaterial, toHierarchyOf: entity)
+            } else if let cachedMaterials = cachedAnatomyHazardMaterials[kind] {
+                restoreMaterials(cachedMaterials)
+                cachedAnatomyHazardMaterials[kind] = nil
+            }
         }
     }
 
@@ -170,6 +190,42 @@ extension SculptingToolModel {
         case 0: return max(extents.y, extents.z)
         case 1: return max(extents.x, extents.z)
         default: return max(extents.x, extents.y)
+        }
+    }
+
+    private func cachedMaterials(for root: Entity) -> [(Entity, [any RealityKit.Material])] {
+        var cache: [(Entity, [any RealityKit.Material])] = []
+        func walk(_ entity: Entity) {
+            if let model = entity.components[ModelComponent.self] {
+                cache.append((entity, model.materials))
+            }
+            for child in entity.children {
+                walk(child)
+            }
+        }
+        walk(root)
+        return cache
+    }
+
+    private func applyMaterial(_ material: any RealityKit.Material, toHierarchyOf root: Entity) {
+        func walk(_ entity: Entity) {
+            if var model = entity.components[ModelComponent.self] {
+                model.materials = Array(repeating: material, count: max(model.materials.count, 1))
+                entity.components.set(model)
+            }
+            for child in entity.children {
+                walk(child)
+            }
+        }
+        walk(root)
+    }
+
+    private func restoreMaterials(_ cachedMaterials: [(Entity, [any RealityKit.Material])]) {
+        for (entity, materials) in cachedMaterials {
+            if var model = entity.components[ModelComponent.self] {
+                model.materials = materials
+                entity.components.set(model)
+            }
         }
     }
 

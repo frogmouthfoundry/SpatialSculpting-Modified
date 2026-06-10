@@ -15,6 +15,11 @@ import Metal
 import Combine
 import QuartzCore
 
+enum BoneDebrisPerformanceTier: Equatable {
+    case normal
+    case zoomed
+}
+
 @MainActor @Observable
 final class BoneDebrisManager {
 
@@ -33,6 +38,8 @@ final class BoneDebrisManager {
     /// Maximum number of debris entities allowed at once.
     /// Oldest debris are removed when this limit is exceeded.
     private let maxDebrisCount: Int = 100
+    private var activeDebrisLimit: Int = 100
+    private var highFidelityDebrisCount: Int = 28
 
     // MARK: - Ejection Force (tunable per-axis)
 
@@ -178,11 +185,17 @@ final class BoneDebrisManager {
 
     /// Cached capsule shape — created once and reused for all debris entities.
     private var cachedDebrisShape: ShapeResource?
+    private var pooledDebrisEntities: [ModelEntity] = []
+    private let pooledDebrisLimit: Int = 100
+    private var performanceTier: BoneDebrisPerformanceTier = .normal
 
     weak var rootEntity: Entity?
     private var debrisContainer: Entity?
 
     private(set) var drawnEntities: [Entity] = []
+    var hasActiveDebrisWork: Bool {
+        !drawnEntities.isEmpty || !pendingEjections.isEmpty || !growingDebris.isEmpty
+    }
 
     // MARK: - Init
 
@@ -259,6 +272,20 @@ final class BoneDebrisManager {
         )
     }
 
+    func setPerformanceTier(_ tier: BoneDebrisPerformanceTier) {
+        guard performanceTier != tier else { return }
+        performanceTier = tier
+        switch tier {
+        case .normal:
+            activeDebrisLimit = maxDebrisCount
+            highFidelityDebrisCount = 28
+        case .zoomed:
+            activeDebrisLimit = 70
+            highFidelityDebrisCount = 14
+        }
+        trimActiveDebrisIfNeeded()
+    }
+
     // MARK: - SDF Blit Management
 
     /// Returns the staging texture for the compute system to blit SDF data into.
@@ -267,6 +294,7 @@ final class BoneDebrisManager {
     /// Request an SDF blit if enough time has passed since the last one.
     func requestSdfBlitIfNeeded() {
         guard hasSDF, !isBlitting else { return }
+        guard drawnEntities.indices.contains(highFidelityStartIndex()) else { return }
         let now = CACurrentMediaTime()
         guard now - lastSdfBlitTime >= sdfBlitInterval else { return }
         lastSdfBlitTime = now
@@ -435,14 +463,9 @@ final class BoneDebrisManager {
               let debrisShape = cachedDebrisShape else { return }
 
         // Enforce debris count limit — remove oldest first.
-        while drawnEntities.count >= maxDebrisCount {
+        while drawnEntities.count >= activeDebrisLimit {
             let oldest = drawnEntities.removeFirst()
-            let oldId = ObjectIdentifier(oldest)
-            debrisStates.removeValue(forKey: oldId)
-            settlingCounters.removeValue(forKey: oldId)
-            growthMultipliers.removeValue(forKey: oldId)
-            spawnTimes.removeValue(forKey: oldId)
-            oldest.removeFromParent()
+            recycleDebrisEntity(oldest)
         }
 
         // Spawn slightly back toward the shaft so slurry originates just above
@@ -452,8 +475,9 @@ final class BoneDebrisManager {
                                                         shaftDirection: shaftDirection)
         updateDebrisSpawnDebugMarker(position: offsetPosition)
 
-        let boxEntity = ModelEntity(mesh: mesh, materials: [material])
-        boxEntity.name = "BoneDebris"
+        let boxEntity = acquireDebrisEntity(mesh: mesh,
+                                            material: material,
+                                            debrisShape: debrisShape)
 
         let orientation = orientationAlongDirection(direction)
 
@@ -468,21 +492,6 @@ final class BoneDebrisManager {
             rotation: orientation,
             translation: offsetPosition
         )
-
-        // Reuse cached shape for collision and physics.
-        boxEntity.components.set(CollisionComponent(shapes: [debrisShape]))
-
-        // Always spawn dynamic so ejection impulse works.
-        // Gravity toggle can switch to static afterward.
-        boxEntity.components.set(PhysicsBodyComponent(
-            shapes: [debrisShape],
-            mass: 0.001,
-            material: physicsMaterial ?? .default,
-            mode: .dynamic
-        ))
-
-        // Hide physics entities — the metaball mesh is the visual representation.
-        boxEntity.components.set(OpacityComponent(opacity: 0.0))
 
         container.addChild(boxEntity)
         drawnEntities.append(boxEntity)
@@ -570,6 +579,7 @@ final class BoneDebrisManager {
         for var entry in growingDebris {
             guard entry.entity.parent != nil else { continue }
             let id = ObjectIdentifier(entry.entity)
+            guard isHighFidelityDebrisEntity(entry.entity) else { continue }
 
             let elapsed = now - entry.lastTick
             if elapsed >= growthInterval {
@@ -607,9 +617,10 @@ final class BoneDebrisManager {
         guard hasSDF, !sdfData.isEmpty else { return }
         guard isEnabled else { return }
 
-        for entity in drawnEntities {
+        for (index, entity) in drawnEntities.enumerated() {
             guard let modelEntity = entity as? ModelEntity,
                   modelEntity.parent != nil else { continue }
+            guard isHighFidelityDebris(at: index) else { continue }
 
             let position = modelEntity.position(relativeTo: debrisContainer)
 
@@ -649,9 +660,10 @@ final class BoneDebrisManager {
     func processSettling() {
         guard isEnabled else { return }
 
-        for entity in drawnEntities {
+        for (index, entity) in drawnEntities.enumerated() {
             guard let modelEntity = entity as? ModelEntity,
                   modelEntity.parent != nil else { continue }
+            guard isHighFidelityDebris(at: index) else { continue }
 
             let id = ObjectIdentifier(modelEntity)
             let currentState = debrisStates[id] ?? .ejecting
@@ -714,9 +726,10 @@ final class BoneDebrisManager {
 
         let radiusSq = toolDisplacementRadius * toolDisplacementRadius
 
-        for entity in drawnEntities {
+        for (index, entity) in drawnEntities.enumerated() {
             guard let modelEntity = entity as? ModelEntity,
                   modelEntity.parent != nil else { continue }
+            guard isHighFidelityDebris(at: index) else { continue }
 
             let id = ObjectIdentifier(modelEntity)
             let state = debrisStates[id] ?? .ejecting
@@ -762,12 +775,7 @@ final class BoneDebrisManager {
             let pos = entity.position(relativeTo: debrisContainer)
             if pos.x < bMin.x || pos.y < bMin.y || pos.z < bMin.z ||
                pos.x > bMax.x || pos.y > bMax.y || pos.z > bMax.z {
-                let id = ObjectIdentifier(entity)
-                debrisStates.removeValue(forKey: id)
-                settlingCounters.removeValue(forKey: id)
-                growthMultipliers.removeValue(forKey: id)
-                spawnTimes.removeValue(forKey: id)
-                entity.removeFromParent()
+                recycleDebrisEntity(entity)
                 drawnEntities.remove(at: i)
             } else {
                 i += 1
@@ -794,7 +802,7 @@ final class BoneDebrisManager {
     // MARK: - Cleanup
 
     func clearAllDebris() {
-        for entity in drawnEntities { entity.removeFromParent() }
+        for entity in drawnEntities { recycleDebrisEntity(entity) }
         drawnEntities.removeAll()
         pendingEjections.removeAll()
         growingDebris.removeAll()
@@ -808,7 +816,7 @@ final class BoneDebrisManager {
     func undoLastStroke(count: Int = 50) {
         let removeCount = min(count, drawnEntities.count)
         let entitiesToRemove = drawnEntities.suffix(removeCount)
-        for entity in entitiesToRemove { entity.removeFromParent() }
+        for entity in entitiesToRemove { recycleDebrisEntity(entity) }
         drawnEntities.removeLast(removeCount)
     }
 
@@ -826,5 +834,78 @@ final class BoneDebrisManager {
                 mode: mode
             ))
         }
+    }
+
+    private func highFidelityStartIndex() -> Int {
+        max(0, drawnEntities.count - highFidelityDebrisCount)
+    }
+
+    private func isHighFidelityDebris(at index: Int) -> Bool {
+        index >= highFidelityStartIndex()
+    }
+
+    private func isHighFidelityDebrisEntity(_ entity: ModelEntity) -> Bool {
+        guard let index = drawnEntities.firstIndex(where: { $0 === entity }) else { return false }
+        return isHighFidelityDebris(at: index)
+    }
+
+    private func trimActiveDebrisIfNeeded() {
+        while drawnEntities.count > activeDebrisLimit {
+            let oldest = drawnEntities.removeFirst()
+            recycleDebrisEntity(oldest)
+        }
+    }
+
+    private func acquireDebrisEntity(mesh: MeshResource,
+                                     material: any Material,
+                                     debrisShape: ShapeResource) -> ModelEntity {
+        if let entity = pooledDebrisEntities.popLast() {
+            entity.components.set(ModelComponent(mesh: mesh, materials: [material]))
+            entity.components.set(CollisionComponent(shapes: [debrisShape]))
+            entity.components.set(PhysicsBodyComponent(
+                shapes: [debrisShape],
+                mass: 0.001,
+                material: physicsMaterial ?? .default,
+                mode: .dynamic
+            ))
+            entity.components.set(PhysicsMotionComponent(linearVelocity: .zero,
+                                                        angularVelocity: .zero))
+            entity.components.set(OpacityComponent(opacity: 0.0))
+            entity.isEnabled = true
+            return entity
+        }
+
+        let entity = ModelEntity(mesh: mesh, materials: [material])
+        entity.name = "BoneDebris"
+        entity.components.set(CollisionComponent(shapes: [debrisShape]))
+        entity.components.set(PhysicsBodyComponent(
+            shapes: [debrisShape],
+            mass: 0.001,
+            material: physicsMaterial ?? .default,
+            mode: .dynamic
+        ))
+        entity.components.set(OpacityComponent(opacity: 0.0))
+        return entity
+    }
+
+    private func recycleDebrisEntity(_ entity: Entity) {
+        clearTracking(for: entity)
+        entity.removeFromParent()
+        guard let modelEntity = entity as? ModelEntity else { return }
+        guard pooledDebrisEntities.count < pooledDebrisLimit else { return }
+        modelEntity.isEnabled = false
+        modelEntity.components.set(PhysicsMotionComponent(linearVelocity: .zero,
+                                                          angularVelocity: .zero))
+        pooledDebrisEntities.append(modelEntity)
+    }
+
+    private func clearTracking(for entity: Entity) {
+        let id = ObjectIdentifier(entity)
+        debrisStates.removeValue(forKey: id)
+        settlingCounters.removeValue(forKey: id)
+        growthMultipliers.removeValue(forKey: id)
+        spawnTimes.removeValue(forKey: id)
+        pendingEjections.removeAll { ($0.entity as Entity) === entity }
+        growingDebris.removeAll { ($0.entity as Entity) === entity }
     }
 }

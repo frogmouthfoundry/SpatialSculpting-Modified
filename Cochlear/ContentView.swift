@@ -12,6 +12,11 @@ import GameController
 import CoreHaptics
 import QuartzCore
 
+private enum ScenePerformanceTier: Equatable {
+    case normal
+    case zoomed
+}
+
 struct ContentView: View {
     var root: Entity = Entity(components: [ComputeSystemComponent(computeSystem: SculptingToolSystem())])
     @State private var fluidSceneRoot: Entity = {
@@ -49,6 +54,8 @@ struct ContentView: View {
     @State private var didLoadInteractiveAnatomyContent: Bool = false
     @State private var didQueueDeferredStartupWork: Bool = false
     @State private var isSlurryDebugUIEnabled: Bool = false
+    @State private var sceneZoomFactor: Float = 1.0
+    @State private var scenePerformanceTier: ScenePerformanceTier = .normal
 
     // Volume transparency toggle (50% transparent when on).
     @State private var isVolumeTransparent: Bool = false
@@ -137,7 +144,7 @@ struct ContentView: View {
         guard fluidWaveEntity == nil else { return }
         do {
             let waveMesh = try AnimatedWaveMesh()
-            waveMesh.segmentCount = 128
+            waveMesh.segmentCount = sceneZoomFactor >= 2.0 ? 64 : 128
             waveMesh.waveDensity = 3.0
             waveMesh.amplitude = 0.0
             waveMesh.speed = 1.0
@@ -153,7 +160,7 @@ struct ContentView: View {
             material.roughness.scale = 0.20
             material.metallic.scale = 0.0
             material.blending = .transparent(opacity: 0.82)
-            material.faceCulling = .none
+            material.faceCulling = .back
 
             let entity = ModelEntity(mesh: meshResource, materials: [material])
             entity.name = "FluidLayer"
@@ -168,13 +175,13 @@ struct ContentView: View {
                     sculptMax.z - 0.15
                 )
                 entity.scale = SIMD3<Float>(
-                    sculptExtent.x * 0.56,
+                    sculptExtent.x * 0.4032,
                     1.0,
-                    sculptExtent.y * 0.56
+                    sculptExtent.y * 0.4032
                 )
             } else {
                 entity.position = SIMD3<Float>(0, 0, 0.23)
-                entity.scale = SIMD3<Float>(0.448, 1.0, 0.448)
+                entity.scale = SIMD3<Float>(0.32256, 1.0, 0.32256)
             }
             entity.orientation = simd_quatf(angle: .pi / 2, axis: SIMD3<Float>(1, 0, 0))
             entity.isEnabled = !isFluidLayerHiddenForDebrisReset
@@ -182,13 +189,16 @@ struct ContentView: View {
 
             fluidWaveMesh = waveMesh
             fluidWaveEntity = entity
+            applyPerformanceGovernor()
         } catch {
             print("Failed to create fluid layer: \(error)")
         }
     }
 
     private func updateFluidLayer(timestep: TimeInterval) {
-        fluidWaveMesh?.update(timestep)
+        if fluidWaveMesh?.needsFrameUpdate == true {
+            fluidWaveMesh?.update(timestep)
+        }
         if isFluidLayerHiddenForDebrisReset,
            sculpting.boneDebrisManager.spawnedDebrisSinceLastClear >= 10 {
             setFluidLayerVisible(true)
@@ -199,6 +209,97 @@ struct ContentView: View {
 
     private func setFluidLayerVisible(_ isVisible: Bool) {
         fluidWaveEntity?.isEnabled = isVisible
+    }
+
+    private func sculptVolumeLocalBounds() -> (min: SIMD3<Float>, max: SIMD3<Float>)? {
+        guard let voxelVolume = marchingCubesMesh?.voxelVolume else { return nil }
+        let dims = SIMD3<Float>(voxelVolume.dimensions)
+        let sculptMin = voxelVolume.voxelStartPosition - voxelVolume.voxelSize * 0.5
+        let sculptMax = voxelVolume.voxelStartPosition + voxelVolume.voxelSize * (dims - 0.5)
+        return (sculptMin, sculptMax)
+    }
+
+    private func sculptVolumePositiveZFacePivotWorld() -> SIMD3<Float> {
+        guard let bounds = sculptVolumeLocalBounds() else { return .zero }
+        let worldBounds = transformedBounds(corners: boundsCorners(min: bounds.min, max: bounds.max),
+                                            matrix: root.transform.matrix)
+        return SIMD3<Float>(
+            (worldBounds.min.x + worldBounds.max.x) * 0.5,
+            (worldBounds.min.y + worldBounds.max.y) * 0.5,
+            worldBounds.max.z
+        )
+    }
+
+    private func setUniformScale(_ entity: Entity, scale: Float) {
+        entity.transform.scale = SIMD3<Float>(repeating: scale)
+    }
+
+    private func translateScalableSceneRoots(z deltaZ: Float) {
+        guard abs(deltaZ) > 0.0001 else { return }
+
+        root.position.z += deltaZ
+        staticSceneRoot.position.z += deltaZ
+        interactiveAnatomyRoot.position.z += deltaZ
+        fluidSceneRoot.position.z += deltaZ
+    }
+
+    private func syncDrillVisualZoom() {
+        let zoomFactor = sceneZoomFactor
+        let bitScale = sculpting.selectedDrillBitScale * zoomFactor
+
+        if let baseModelTransform = sculpting.drillModelBaseLocalTransform {
+            let tipPivot = sculpting.drillBallLocalOffset
+            var zoomedModelTransform = baseModelTransform
+            zoomedModelTransform.scale = baseModelTransform.scale * zoomFactor
+            zoomedModelTransform.translation = tipPivot + (baseModelTransform.translation - tipPivot) * zoomFactor
+            sculpting.drillModelDefaultLocalTransform = zoomedModelTransform
+
+            if let drillModel = sculpting.drillModelEntity,
+               drillModel.parent === sculpting.sculptingEntity {
+                drillModel.transform = zoomedModelTransform
+            }
+        }
+
+        if var defaultBallTransform = sculpting.drillBallDefaultLocalTransform {
+            defaultBallTransform.translation = sculpting.drillBallLocalOffset
+            defaultBallTransform.scale = SIMD3<Float>(repeating: bitScale)
+            sculpting.drillBallDefaultLocalTransform = defaultBallTransform
+        }
+
+        if let drillBall = sculpting.drillBallEntity,
+           drillBall.parent === sculpting.sculptingEntity {
+            drillBall.position = sculpting.drillBallLocalOffset
+            drillBall.scale = SIMD3<Float>(repeating: bitScale)
+        }
+    }
+
+    private func applySceneZoomScale() {
+        setUniformScale(root, scale: volumeScaleFactor * sceneZoomFactor)
+        setUniformScale(staticSceneRoot, scale: sceneZoomFactor)
+        setUniformScale(interactiveAnatomyRoot, scale: sceneZoomFactor)
+        setUniformScale(fluidSceneRoot, scale: sceneZoomFactor)
+    }
+
+    private func applySceneZoom(_ newZoomFactor: Float) {
+        guard abs(newZoomFactor - sceneZoomFactor) > 0.0001 else { return }
+
+        let anchoredFrontZ = sculptVolumePositiveZFacePivotWorld().z
+        sceneZoomFactor = newZoomFactor
+        applySceneZoomScale()
+        syncDrillVisualZoom()
+        applyPerformanceGovernor()
+        let shiftedFrontZ = sculptVolumePositiveZFacePivotWorld().z
+        translateScalableSceneRoots(z: anchoredFrontZ - shiftedFrontZ)
+        if sculpting.sculptingEntity != nil {
+            sculpting.collisionManager.scheduleRegeneration()
+        }
+    }
+
+    private func resetZoomedSceneTransformsToBaseline() {
+        root.transform.translation = .zero
+        staticSceneRoot.transform = Transform()
+        interactiveAnatomyRoot.transform = Transform()
+        fluidSceneRoot.transform = Transform()
     }
 
     private var selectedBitRadiusMeters: Float {
@@ -212,9 +313,8 @@ struct ContentView: View {
         sculpting.boneDebrisManager.newDebrisSizeScale = scale
         sculpting.selectedDrillBitScale = scale
 
-        if let drillBall = sculpting.drillBallEntity {
-            drillBall.scale = SIMD3<Float>(repeating: scale)
-            sculpting.drillBallDefaultLocalTransform?.scale = SIMD3<Float>(repeating: scale)
+        if sculpting.drillBallEntity != nil {
+            syncDrillVisualZoom()
             didApplyBitSizeToDrillBall = true
         } else {
             didApplyBitSizeToDrillBall = false
@@ -233,6 +333,19 @@ struct ContentView: View {
         }
         .buttonStyle(.borderedProminent)
         .tint(selectedBitSizeMM == mm ? .green : .gray)
+    }
+
+    private func zoomButton(_ factor: Float) -> some View {
+        let isActive = abs(sceneZoomFactor - factor) < 0.001
+        let label = abs(factor - 1.0) < 0.001
+            ? "1.0x"
+            : (abs(factor - 1.5) < 0.001 ? "1.5x" : "2.0x")
+
+        return Button(label) {
+            applySceneZoom(factor)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(isActive ? .green : .gray)
     }
 
     private func triggerFluidRippleIfNeeded() {
@@ -260,6 +373,30 @@ struct ContentView: View {
                                             volumeBoundsMax: slurryBounds.max)
         } else {
             sculpting.replaceBoneSlurryGrid()
+        }
+        applyPerformanceGovernor()
+    }
+
+    private func performanceTier(for zoomFactor: Float) -> ScenePerformanceTier {
+        zoomFactor >= 2.0 ? .zoomed : .normal
+    }
+
+    private func applyPerformanceGovernor() {
+        let tier = performanceTier(for: sceneZoomFactor)
+        let tierChanged = tier != scenePerformanceTier
+        scenePerformanceTier = tier
+
+        let desiredFluidSegments = tier == .zoomed ? 64 : 128
+        if let waveMesh = fluidWaveMesh, waveMesh.segmentCount != desiredFluidSegments {
+            waveMesh.segmentCount = desiredFluidSegments
+            waveMesh.update(0)
+        }
+
+        sculpting.boneSlurryGrid?.setPerformanceTier(tier == .zoomed ? .zoomed : .normal)
+        sculpting.collisionManager.setPerformanceTier(tier == .zoomed ? .zoomed : .normal)
+        sculpting.boneDebrisManager.setPerformanceTier(tier == .zoomed ? .zoomed : .normal)
+        if tierChanged, sculpting.sculptingEntity != nil {
+            sculpting.collisionManager.scheduleRegeneration()
         }
     }
 
@@ -441,6 +578,7 @@ struct ContentView: View {
             if let voxelVolume = marchingCubesMesh?.voxelVolume {
                 sculpting.collisionManager.setup(rootEntity: root, voxelVolume: voxelVolume)
             }
+            applyPerformanceGovernor()
 
             // Update sculpting tool and check for tracking quality each frame.
             _ = content.subscribe(to: SceneEvents.Update.self) {
@@ -564,9 +702,15 @@ struct ContentView: View {
     }
 
     private func applyLoadedVolumePresentationTransform() {
+        let preservedZoomFactor = sceneZoomFactor
+        sceneZoomFactor = 1.0
+        resetZoomedSceneTransformsToBaseline()
         root.transform.rotation = simd_quatf(angle: (.pi * 3.0) / 2.0, axis: SIMD3<Float>(0, 1, 0))
         volumeScaleFactor = 0.75
         applyVolumeScale(volumeScaleFactor)
+        if abs(preservedZoomFactor - 1.0) > 0.0001 {
+            applySceneZoom(preservedZoomFactor)
+        }
 
         let worldGravity = BoneDebrisManager.debrisGravity
         let inverseRotation = root.transform.rotation.inverse
@@ -723,10 +867,9 @@ struct ContentView: View {
     // MARK: - Volume Scale
 
     /// Scale the sculpting volume (mesh chunks + bone slurry + collision) uniformly.
-    /// Drill overlay, drill ball, and sculpting tool head are NOT affected since
-    /// they are positioned relative to the accessory anchor, not the root entity.
+    /// The base scale combines with the scene zoom factor.
     private func applyVolumeScale(_ scale: Float) {
-        root.transform.scale = SIMD3<Float>(repeating: scale)
+        root.transform.scale = SIMD3<Float>(repeating: scale * sceneZoomFactor)
     }
 
     func shrinkVolumeButton() -> some View {
@@ -762,17 +905,6 @@ struct ContentView: View {
                         HStack {
                             openButton()
                             clearDebrisButton()
-                            slurryDebugButton()
-                        }
-                        HStack {
-                            rotateXButton()
-                            rotateYButton()
-                            rotateZButton()
-                        }
-                        HStack {
-                            toggleTransparencyButton()
-                            shrinkVolumeButton()
-                            growVolumeButton()
                         }
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Bit Size")
@@ -781,6 +913,32 @@ struct ContentView: View {
                                 bitSizeButton(6)
                                 bitSizeButton(4)
                                 bitSizeButton(2)
+                            }
+                        }
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Zoom")
+                                .font(.caption)
+                            HStack {
+                                zoomButton(1.0)
+                                zoomButton(1.5)
+                                zoomButton(2.0)
+                            }
+                        }
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Debug Mode")
+                                .font(.caption)
+                            HStack {
+                                toggleTransparencyButton()
+                                slurryDebugButton()
+                            }
+                            HStack {
+                                rotateXButton()
+                                rotateYButton()
+                                rotateZButton()
+                            }
+                            HStack {
+                                shrinkVolumeButton()
+                                growVolumeButton()
                             }
                         }
                     }.padding().glassBackgroundEffect()

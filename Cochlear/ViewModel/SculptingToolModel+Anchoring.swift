@@ -56,43 +56,16 @@ extension SculptingToolModel {
         _cachedDrillMaterials = cache
     }
 
-    /// Tint the entire drill model orange-yellow to indicate shaft collision.
+    /// Tint the drill model to the active warning state.
     func tintDrillRed() {
         isShaftCollisionWarningActive = true
-        guard !_isDrillTintedRed else { return }
-        _isDrillTintedRed = true
-        let warningMaterial = SimpleMaterial(color: shaftCollisionWarningUIColor, roughness: 0.3, isMetallic: false)
-        if let drillModel = drillModelEntity {
-            func walk(_ entity: Entity) {
-                if var model = entity.components[ModelComponent.self] {
-                    model.materials = Array(repeating: warningMaterial, count: model.materials.count)
-                    entity.components.set(model)
-                }
-                for child in entity.children {
-                    walk(child)
-                }
-            }
-            walk(drillModel)
-        }
-        if var ballModel = drillBallEntity?.components[ModelComponent.self] {
-            ballModel.materials = Array(repeating: warningMaterial, count: ballModel.materials.count)
-            if let drillBall = drillBallEntity {
-                drillBall.components.set(ballModel)
-            }
-        }
+        applyDrillWarningAppearance()
     }
 
     /// Restore original drill materials after shaft collision clears.
     func restoreDrillMaterials() {
         isShaftCollisionWarningActive = false
-        guard _isDrillTintedRed else { return }
-        _isDrillTintedRed = false
-        for (entity, materials) in _cachedDrillMaterials {
-            if var model = entity.components[ModelComponent.self] {
-                model.materials = materials
-                entity.components.set(model)
-            }
-        }
+        applyDrillWarningAppearance()
     }
 
     /// Tint all sculpt mesh chunks to the current warning state.
@@ -109,14 +82,65 @@ extension SculptingToolModel {
 
     func setAnatomyHazardFlashActive(_ isActive: Bool) {
         isAnatomyHazardFlashActive = isActive
+        applyDrillWarningAppearance()
         applySculptMeshWarningAppearance()
+        applyAnatomyHazardWarningAppearance()
+    }
+
+    private func applyDrillWarningAppearance() {
+        let desiredColor: UIColor?
+        if isAnatomyHazardFlashActive {
+            desiredColor = anatomyHazardFlashUIColor
+        } else if isShaftCollisionWarningActive {
+            desiredColor = shaftCollisionWarningUIColor
+        } else {
+            desiredColor = nil
+        }
+
+        guard let desiredColor else {
+            guard _isDrillTintedRed else { return }
+            _isDrillTintedRed = false
+            for (entity, materials) in _cachedDrillMaterials {
+                if var model = entity.components[ModelComponent.self] {
+                    model.materials = materials
+                    entity.components.set(model)
+                }
+            }
+            return
+        }
+
+        if _cachedDrillMaterials.isEmpty {
+            cacheDrillMaterials()
+        }
+
+        let warningMaterial = SimpleMaterial(color: desiredColor, roughness: 0.3, isMetallic: false)
+        if let drillModel = drillModelEntity {
+            func walk(_ entity: Entity) {
+                if var model = entity.components[ModelComponent.self] {
+                    model.materials = Array(repeating: warningMaterial, count: max(model.materials.count, 1))
+                    entity.components.set(model)
+                }
+                for child in entity.children {
+                    walk(child)
+                }
+            }
+            walk(drillModel)
+        }
+        if var ballModel = drillBallEntity?.components[ModelComponent.self] {
+            ballModel.materials = Array(repeating: warningMaterial, count: max(ballModel.materials.count, 1))
+            if let drillBall = drillBallEntity {
+                drillBall.components.set(ballModel)
+            }
+        }
+        _isDrillTintedRed = true
     }
 
     private func applySculptMeshWarningAppearance() {
         guard let root = rootEntity else { return }
+        let sculptMeshChunks = root.children.filter { $0.name == "SculptMeshChunk" }
 
         if _cachedSculptMeshMaterials.isEmpty {
-            for child in root.children where child.name == "SculptMeshChunk" {
+            for child in sculptMeshChunks {
                 if let model = child.components[ModelComponent.self] {
                     _cachedSculptMeshMaterials.append((child, model.materials))
                 }
@@ -135,12 +159,14 @@ extension SculptingToolModel {
         guard let desiredColor else {
             guard _isSculptMeshTintedRed else { return }
             _isSculptMeshTintedRed = false
-            for (entity, materials) in _cachedSculptMeshMaterials {
+            let sculptMaterial = makeSculptMaterial()
+            for entity in sculptMeshChunks {
                 if var model = entity.components[ModelComponent.self] {
-                    model.materials = materials
+                    model.materials = Array(repeating: sculptMaterial, count: max(model.materials.count, 1))
                     entity.components.set(model)
                 }
             }
+            _cachedSculptMeshMaterials.removeAll()
             return
         }
 
@@ -256,6 +282,7 @@ extension SculptingToolModel {
 
         anchor.addChild(drillModel)
         drillModelEntity = drillModel
+        drillModelBaseLocalTransform = drillModel.transform
         drillModelDefaultLocalTransform = drillModel.transform
 
         // Compute the drill tip position in anchor-local space.

@@ -23,13 +23,18 @@ import RealityKit
 import Metal
 import QuartzCore
 
+enum CollisionPerformanceTier: Equatable {
+    case normal
+    case zoomed
+}
+
 @MainActor @Observable
 final class CollisionManager: @unchecked Sendable {
 
     // MARK: - Configuration
 
     /// Minimum seconds between sculpt-triggered collision updates.
-    private let updateInterval: TimeInterval = 0.5
+    private var updateInterval: TimeInterval = 0.5
 
     /// Coarse step: sample every Nth voxel for collision mesh.
     /// 4 = effective 32³ from 128³ volume. Keeps vertex count under
@@ -42,7 +47,7 @@ final class CollisionManager: @unchecked Sendable {
     /// Local high-fidelity collision region centered on the shaft detector.
     /// This is specified in displayed-space meters and converted back into
     /// root-local extents using the root's current scale.
-    private let localFocusDisplayedExtent: Float = 0.10
+    private var localFocusDisplayedExtent: Float = 0.10
     /// Use full-resolution SDF marching cubes inside the local focus chunk.
     private let localStep: Int = 1
 
@@ -72,9 +77,10 @@ final class CollisionManager: @unchecked Sendable {
     private var isRegenerating: Bool = false
     private var pendingRegeneration: Bool = false
     /// Regenerate the expensive static collision mesh less frequently than SDF cache refresh.
-    private let fullMeshRegenerationInterval: TimeInterval = 1.5
+    private var fullMeshRegenerationInterval: TimeInterval = 1.0
     private var lastFullMeshRegenerationTime: TimeInterval = 0
     private var forceFullMeshRegeneration: Bool = true
+    private var performanceTier: CollisionPerformanceTier = .normal
 
     /// Set by scheduleRegeneration / processUpdatesIfNeeded.
     /// The SculptingToolSystem picks this up and triggers the blit.
@@ -119,6 +125,21 @@ final class CollisionManager: @unchecked Sendable {
         self.localCollisionEntity = localEntity
 
         print("[CollisionManager] Setup: \(dimensions.x)×\(dimensions.y)×\(dimensions.z), step=\(coarseStep)")
+    }
+
+    func setPerformanceTier(_ tier: CollisionPerformanceTier) {
+        guard performanceTier != tier else { return }
+        performanceTier = tier
+        switch tier {
+        case .normal:
+            updateInterval = 0.5
+            fullMeshRegenerationInterval = 1.0
+            localFocusDisplayedExtent = 0.10
+        case .zoomed:
+            updateInterval = 0.33
+            fullMeshRegenerationInterval = 1.0
+            localFocusDisplayedExtent = 0.08
+        }
     }
 
     // MARK: - Triggers

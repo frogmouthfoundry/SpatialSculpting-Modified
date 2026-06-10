@@ -45,6 +45,7 @@ final class SculptingToolModel {
     @ObservationIgnored var drillModelEntity: Entity? = nil
     @ObservationIgnored var drillBallEntity: ModelEntity? = nil
     var selectedDrillBitScale: Float = 1.0
+    var drillModelBaseLocalTransform: Transform? = nil
 
     /// Anchor-local offset from the accessory origin to the drill ball center.
     /// Computed dynamically from the USDZ model bounds in `attachDrillModel`.
@@ -73,6 +74,9 @@ final class SculptingToolModel {
     @ObservationIgnored var anatomyEffectsRoot: Entity? = nil
     @ObservationIgnored var anatomySafezones: [AnatomySafezoneSphere] = []
     @ObservationIgnored var activeAnatomyHazards: Set<AnatomyHazardKind> = []
+    @ObservationIgnored var flashingAnatomyHazards: Set<AnatomyHazardKind> = []
+    @ObservationIgnored var anatomyHazardEntities: [AnatomyHazardKind: Entity] = [:]
+    @ObservationIgnored var cachedAnatomyHazardMaterials: [AnatomyHazardKind: [(Entity, [any RealityKit.Material])]] = [:]
     @ObservationIgnored var hazardFlashTask: Task<Void, Never>? = nil
     @ObservationIgnored var bloodSpurtTemplate: Entity? = nil
 
@@ -93,6 +97,7 @@ final class SculptingToolModel {
     private var cachedDrillBallRPMBeforeFreeze: Int? = nil
     var drillModelDefaultLocalTransform: Transform? = nil
     var drillBallDefaultLocalTransform: Transform? = nil
+    private var lastTrackingAudioState: AccessoryAnchor.TrackingState? = nil
 
     // Tracks carving state for logging and particle bursts
     private var wasCarving: Bool = false
@@ -196,6 +201,7 @@ final class SculptingToolModel {
                 child.components.set(model)
             }
         }
+        _cachedSculptMeshMaterials.removeAll()
     }
 
     // Raycast from the accessory to the add/subtract elements of the toolbar to swap to
@@ -290,9 +296,10 @@ final class SculptingToolModel {
             return
         }
 
-        // Reassert drill tracking audio every frame so it recovers if playback stops
-        // during heavy scene work such as bundled volume loading.
-        updateDrillTrackingAudio(for: accessoryAnchor.trackingState)
+        if lastTrackingAudioState != accessoryAnchor.trackingState {
+            lastTrackingAudioState = accessoryAnchor.trackingState
+            updateDrillTrackingAudio(for: accessoryAnchor.trackingState)
+        }
         
         if var sculptingToolComponent = sculptingTool.components[SculptingToolComponent.self] {
             if sculptingToolComponent.trackingState != accessoryAnchor.trackingState {
@@ -315,7 +322,8 @@ final class SculptingToolModel {
     func updateSculptingTool() {
         // Process pending debris ejection forces (frame countdown).
         let now = CACurrentMediaTime()
-        if now - lastDebrisSimulationTime >= debrisSimulationInterval {
+        let hasDebrisWork = boneDebrisManager.hasActiveDebrisWork
+        if hasDebrisWork, now - lastDebrisSimulationTime >= debrisSimulationInterval {
             lastDebrisSimulationTime = now
             boneDebrisManager.processPendingEjections()
             boneDebrisManager.processGrowth()
@@ -349,8 +357,10 @@ final class SculptingToolModel {
 
         // Upload debris particle data to bone slurry grid for metaball visualization.
         // Also cull debris that has left the volume bounds.
-        boneDebrisManager.cullOutOfBoundsDebris()
-        if let root = rootEntity {
+        if hasDebrisWork {
+            boneDebrisManager.cullOutOfBoundsDebris()
+        }
+        if hasDebrisWork, let root = rootEntity {
             boneSlurryGrid?.uploadParticles(from: boneDebrisManager,
                                             rootEntity: root)
         }
@@ -369,10 +379,8 @@ final class SculptingToolModel {
 
         // Compute live drill model/bit world transforms directly from anchor + cached
         // local transforms. This keeps carving/collision aligned to visuals.
-        let liveModelTransform = currentLiveDrillModelTransform(rootEntity: rootEntity,
-                                                                anchorTransform: liveAnchorTransform)
-        let liveBallTransform = currentLiveDrillBallTransform(rootEntity: rootEntity,
-                                                              anchorTransform: liveAnchorTransform)
+        let liveModelTransform = currentLiveDrillModelTransform(anchorTransform: liveAnchorTransform)
+        let liveBallTransform = currentLiveDrillBallTransform(anchorTransform: liveAnchorTransform)
 
         // Compute live sculpting tool pose (tip-centered) from anchor.
         var liveToolTransform = liveAnchorTransform
@@ -641,18 +649,16 @@ final class SculptingToolModel {
         return Transform(matrix: worldMatrix)
     }
 
-    private func currentLiveDrillModelTransform(rootEntity: Entity,
-                                                anchorTransform: Transform) -> Transform? {
-        if !isDrillOverlayDetachedForFreeze, let drillModel = drillModelEntity {
-            return Transform(matrix: drillModel.transformMatrix(relativeTo: rootEntity))
+    private func currentLiveDrillModelTransform(anchorTransform: Transform) -> Transform? {
+        if !isDrillOverlayDetachedForFreeze {
+            return liveDrillModelWorldTransform(anchorTransform: anchorTransform)
         }
         return liveDrillModelWorldTransform(anchorTransform: anchorTransform)
     }
 
-    private func currentLiveDrillBallTransform(rootEntity: Entity,
-                                               anchorTransform: Transform) -> Transform? {
-        if !isDrillOverlayDetachedForFreeze, let drillBall = drillBallEntity {
-            return Transform(matrix: drillBall.transformMatrix(relativeTo: rootEntity))
+    private func currentLiveDrillBallTransform(anchorTransform: Transform) -> Transform? {
+        if !isDrillOverlayDetachedForFreeze {
+            return liveDrillBallWorldTransform(anchorTransform: anchorTransform)
         }
         return liveDrillBallWorldTransform(anchorTransform: anchorTransform)
     }
