@@ -35,6 +35,10 @@ struct MarchingCubesMeshSculptor {
         sculptPipeline = makeComputePipeline(named: "sculpt")
         sampleSDFPipeline = makeComputePipeline(named: "sampleSDF")
         sdfResultBuffer = metalDevice?.makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared)
+        if let ptr = sdfResultBuffer?.contents().bindMemory(to: Float.self, capacity: 1) {
+            // Default to "far from surface" until the first real GPU sample lands.
+            ptr.pointee = Float.greatestFiniteMagnitude
+        }
         self.marchingCubesMesh = marchingCubesMesh
     }
     

@@ -359,11 +359,6 @@ final class SculptingToolModel {
             return
         }
 
-        // Collision/SDF refresh is only needed once a tracked tool exists.
-        collisionManager.processUpdatesIfNeeded()
-        if !collisionManager.hasSDFCache {
-            collisionManager.scheduleRegeneration()
-        }
         updateTrackingStateIndicatorIfDirty(sculptingEntity: sculptingEntity)
         guard let rootEntity = rootEntity,
               let liveAnchorMatrix = try? sculptingEntity.transform(from: rootEntity) else {
@@ -402,6 +397,13 @@ final class SculptingToolModel {
         // (the USDZ model body goes in +Z from the tip).
         let shaftAxis = (liveModelTransform?.rotation ?? liveToolTransform.rotation).act(SIMD3<Float>(0, 0, 1))
         let shaftDirection = simd_length_squared(shaftAxis) > 1e-8 ? simd_normalize(shaftAxis) : SIMD3<Float>(0, 0, 1)
+        let shaftDetectorCenter = liveToolTransform.translation + shaftDirection * shaftCollisionDetector.detectorCenterOffset
+        collisionManager.updateLocalCollisionFocus(centerInRoot: shaftDetectorCenter)
+        // Collision/SDF refresh is only needed once a tracked tool exists.
+        collisionManager.processUpdatesIfNeeded()
+        if !collisionManager.hasSDFCache {
+            collisionManager.scheduleRegeneration()
+        }
         let shaftResult = shaftCollisionDetector.test(
             tipPosition: liveToolTransform.translation,
             shaftDirection: shaftDirection,

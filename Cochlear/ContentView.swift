@@ -48,6 +48,7 @@ struct ContentView: View {
     @State private var didLoadStaticSceneContent: Bool = false
     @State private var didLoadInteractiveAnatomyContent: Bool = false
     @State private var didQueueDeferredStartupWork: Bool = false
+    @State private var isSlurryDebugUIEnabled: Bool = false
 
     // Volume transparency toggle (50% transparent when on).
     @State private var isVolumeTransparent: Bool = false
@@ -309,39 +310,29 @@ struct ContentView: View {
         let dims = SIMD3<Float>(voxelVolume.dimensions)
         let sculptLocalMin = voxelVolume.voxelStartPosition - voxelVolume.voxelSize * 0.5
         let sculptLocalMax = voxelVolume.voxelStartPosition + voxelVolume.voxelSize * (dims - 0.5)
-
-        // Define the slurry box in the displayed frame after the root's
-        // presentation rotation/scale, then convert it back into root-local
-        // bounds for the slurry grid.
-        let rootMatrix = root.transform.matrix
-        let sculptWorldBounds = transformedBounds(
-            corners: boundsCorners(min: sculptLocalMin, max: sculptLocalMax),
-            matrix: rootMatrix
-        )
-        let sculptWorldExtent = sculptWorldBounds.max - sculptWorldBounds.min
-        let sculptWorldCenterXY = SIMD2<Float>(
-            (sculptWorldBounds.min.x + sculptWorldBounds.max.x) * 0.5,
-            (sculptWorldBounds.min.y + sculptWorldBounds.max.y) * 0.5
+        let sculptLocalExtent = sculptLocalMax - sculptLocalMin
+        let sculptLocalCenterYZ = SIMD2<Float>(
+            (sculptLocalMin.y + sculptLocalMax.y) * 0.5,
+            (sculptLocalMin.z + sculptLocalMax.z) * 0.5
         )
 
         // Start from the currently reduced slurry size, then enlarge it by 25%.
         let baseAxisScale = Float(pow(0.25, 1.0 / 3.0)) * 1.25 * 0.5
         let axisScale = baseAxisScale * 1.25
-        let slurryWorldExtent = sculptWorldExtent * axisScale
+        let slurryLocalExtent = sculptLocalExtent * axisScale
 
-        let slurryWorldMinX = sculptWorldCenterXY.x - slurryWorldExtent.x * 0.5
-        let slurryWorldMaxX = sculptWorldCenterXY.x + slurryWorldExtent.x * 0.5
-        let slurryWorldMinY = sculptWorldCenterXY.y - slurryWorldExtent.y * 0.5
-        let slurryWorldMaxY = sculptWorldCenterXY.y + slurryWorldExtent.y * 0.5
-        let slurryWorldMaxZ = sculptWorldBounds.max.z + 0.05
-        let slurryWorldMinZ = slurryWorldMaxZ - slurryWorldExtent.z
+        // Anchor against the sculpt volume's pre-load +X face so the existing
+        // root rotation carries the slurry onto the displayed +Z side.
+        let slurryLocalMaxX = sculptLocalMax.x + 0.05
+        let slurryLocalMinX = slurryLocalMaxX - slurryLocalExtent.x
+        let slurryLocalMinY = sculptLocalCenterYZ.x - slurryLocalExtent.y * 0.5
+        let slurryLocalMaxY = sculptLocalCenterYZ.x + slurryLocalExtent.y * 0.5
+        let slurryLocalMinZ = sculptLocalCenterYZ.y - slurryLocalExtent.z * 0.5
+        let slurryLocalMaxZ = sculptLocalCenterYZ.y + slurryLocalExtent.z * 0.5
 
-        return transformedBounds(
-            corners: boundsCorners(
-                min: SIMD3<Float>(slurryWorldMinX, slurryWorldMinY, slurryWorldMinZ),
-                max: SIMD3<Float>(slurryWorldMaxX, slurryWorldMaxY, slurryWorldMaxZ)
-            ),
-            matrix: rootMatrix.inverse
+        return (
+            SIMD3<Float>(slurryLocalMinX, slurryLocalMinY, slurryLocalMinZ),
+            SIMD3<Float>(slurryLocalMaxX, slurryLocalMaxY, slurryLocalMaxZ)
         )
     }
 
@@ -624,22 +615,26 @@ struct ContentView: View {
     }
 
     private func setSlurryDebugEnabled(_ isEnabled: Bool) {
+        isSlurryDebugUIEnabled = isEnabled
         sculpting.isSlurryDebugEnabled = isEnabled
         sculpting.boneDebrisManager.setSlurryDebugEnabled(isEnabled)
         sculpting.boneSlurryGrid?.setSlurryDebugEnabled(isEnabled)
-        if !isEnabled {
+        if isEnabled {
+            sculpting.updateDrillTipDebugMarker(position: sculpting.sculptingTool.position)
+            sculpting.boneDebrisManager.updateDebrisSpawnPreview(sculptingTool: sculpting.sculptingTool)
+        } else {
             sculpting.drillTipDebugMarker?.isEnabled = false
         }
     }
 
     func slurryDebugButton() -> some View {
         Button {
-            setSlurryDebugEnabled(!sculpting.isSlurryDebugEnabled)
+            setSlurryDebugEnabled(!isSlurryDebugUIEnabled)
         } label: {
-            Text(sculpting.isSlurryDebugEnabled ? "Slurry Debug ON" : "Slurry Debug Off")
+            Text(isSlurryDebugUIEnabled ? "Slurry Debug ON" : "Slurry Debug Off")
         }
         .buttonStyle(.borderedProminent)
-        .tint(sculpting.isSlurryDebugEnabled ? .green : .gray)
+        .tint(isSlurryDebugUIEnabled ? .green : .gray)
     }
 
     private func handleClearDebris() {

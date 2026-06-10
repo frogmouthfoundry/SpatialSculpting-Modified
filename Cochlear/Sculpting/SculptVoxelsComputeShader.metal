@@ -86,6 +86,13 @@ void sampleSDF(texture3d<float, access::read> voxels [[texture(0)]],
                uint3 threadPos [[thread_position_in_grid]]) {
     // Convert world position to voxel coordinates
     float3 voxelCoordF = (worldPosition - params.voxelStartPosition) / params.voxelSize;
+    float3 maxCoord = float3(params.dimensions - 1);
+    if (any(voxelCoordF < float3(0.0)) || any(voxelCoordF > maxCoord)) {
+        // Treat out-of-bounds as far from the surface so carving/contact only
+        // becomes active when the sculpting radius actually overlaps the volume.
+        result = FLT_MAX;
+        return;
+    }
     uint3 voxelCoord = uint3(clamp(voxelCoordF, float3(0), float3(params.dimensions - 1)));
     result = voxels.read(voxelCoord).r;
 }
