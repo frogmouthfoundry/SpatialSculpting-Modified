@@ -26,6 +26,26 @@ import RealityKit
 
 extension SculptingToolModel {
 
+    func removeSpatialAccessoryAnchor(for accessoryID: ObjectIdentifier) {
+        if let anchor = spatialAccessoryAnchors[accessoryID] {
+            anchor.removeFromParent()
+            if sculptingEntity === anchor {
+                sculptingEntity = nil
+                drillModelEntity = nil
+                drillBallEntity = nil
+                drillModelBaseLocalTransform = nil
+                drillModelDefaultLocalTransform = nil
+                drillBallDefaultLocalTransform = nil
+            }
+        }
+        spatialAccessoryAnchors.removeValue(forKey: accessoryID)
+        configuredSpatialAccessoryIDs.remove(accessoryID)
+        if activeSpatialAccessoryID == accessoryID {
+            activeSpatialAccessoryID = nil
+            activeSpatialAccessoryKind = nil
+        }
+    }
+
     private var shaftCollisionWarningUIColor: UIColor {
         UIColor(red: 1.0, green: 0.76, blue: 0.18, alpha: 1.0)
     }
@@ -319,6 +339,27 @@ extension SculptingToolModel {
     // Set up stylus or controller inputs.
     @MainActor
     func setupSpatialAccessory(device: GCDevice, hapticsModel: HapticsModel) async throws {
+        let accessoryID = ObjectIdentifier(device)
+        let accessoryKind: SpatialAccessoryKind = (device is GCStylus) ? .stylus : .controller
+
+        if configuredSpatialAccessoryIDs.contains(accessoryID) {
+            return
+        }
+
+        if activeSpatialAccessoryKind == accessoryKind, sculptingEntity != nil {
+            return
+        }
+
+        if accessoryKind == .controller, activeSpatialAccessoryKind == .stylus {
+            return
+        }
+
+        if accessoryKind == .stylus,
+           let activeID = activeSpatialAccessoryID,
+           activeSpatialAccessoryKind == .controller {
+            removeSpatialAccessoryAnchor(for: activeID)
+        }
+
         let source = try await AnchoringComponent.AccessoryAnchoringSource(device: device)
         
         guard let location = source.locationName(named: "aim") ?? source.locationName(named: "tip") else {
@@ -331,7 +372,11 @@ extension SculptingToolModel {
         
         sculptingEntity.name = "SculptingEntity"
         
-        rootEntity?.addChild(sculptingEntity)
+        (accessoryRootEntity ?? rootEntity)?.addChild(sculptingEntity)
+        configuredSpatialAccessoryIDs.insert(accessoryID)
+        spatialAccessoryAnchors[accessoryID] = sculptingEntity
+        activeSpatialAccessoryID = accessoryID
+        activeSpatialAccessoryKind = accessoryKind
         
         addSculptingTooltip(to: sculptingEntity)
         

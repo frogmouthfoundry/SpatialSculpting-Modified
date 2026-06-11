@@ -12,11 +12,17 @@ import QuartzCore
 
 @MainActor @Observable
 final class SculptingToolModel {
+    enum SpatialAccessoryKind {
+        case stylus
+        case controller
+    }
+
     // Min and max radii of the sculpting tool.
     let minRadius: Float = 0.002
     let maxRadius: Float = 0.5
 
     @ObservationIgnored var rootEntity: Entity? = nil // The root entity in the RealityView.
+    @ObservationIgnored var accessoryRootEntity: Entity? = nil // Untransformed scene root for accessory anchors.
 
     @ObservationIgnored let sculptingTool = Entity(components: [ModelComponent(mesh: .generateSphere(radius: 0.001), materials: [SimpleMaterial()]),
                                                                 OpacityComponent(opacity: 0.01)])
@@ -32,6 +38,7 @@ final class SculptingToolModel {
     @ObservationIgnored var hapticsModel: HapticsModel? = nil
     @ObservationIgnored var drillAudioModel: DrillAudioModel? = nil
     @ObservationIgnored var shouldClearDebris: Bool = false
+    @ObservationIgnored var isSpatialToolbarPanelVisible: Bool = false
 
     // Sculpt material management
     var loadedRoughnessValue: Float = 0.5
@@ -79,6 +86,11 @@ final class SculptingToolModel {
     @ObservationIgnored var cachedAnatomyHazardMaterials: [AnatomyHazardKind: [(Entity, [any RealityKit.Material])]] = [:]
     @ObservationIgnored var hazardFlashTask: Task<Void, Never>? = nil
     @ObservationIgnored var bloodSpurtTemplate: Entity? = nil
+    @ObservationIgnored var configuredSpatialAccessoryIDs: Set<ObjectIdentifier> = []
+    @ObservationIgnored var spatialAccessoryAnchors: [ObjectIdentifier: AnchorEntity] = [:]
+    @ObservationIgnored var activeSpatialAccessoryID: ObjectIdentifier? = nil
+    @ObservationIgnored var activeSpatialAccessoryKind: SpatialAccessoryKind? = nil
+    @ObservationIgnored var didRegisterAccessoryNotifications: Bool = false
 
     // Shaft collision freeze/recovery state.
     private let shaftFreezeDuration: TimeInterval = 0.3
@@ -95,6 +107,8 @@ final class SculptingToolModel {
     private var recoveryStartDrillBallTransform: Transform? = nil
     private var isDrillOverlayDetachedForFreeze: Bool = false
     private var cachedDrillBallRPMBeforeFreeze: Int? = nil
+    @ObservationIgnored var isShaftCollisionDetectionSuspended: Bool = true
+    private var shaftCollisionDetectionResumeTime: TimeInterval = .greatestFiniteMagnitude
     var drillModelDefaultLocalTransform: Transform? = nil
     var drillBallDefaultLocalTransform: Transform? = nil
     private var lastTrackingAudioState: AccessoryAnchor.TrackingState? = nil
@@ -268,25 +282,13 @@ final class SculptingToolModel {
     }
     
     func handlePalettePress(pressed: Bool) {
-        guard let sculptingEntity = sculptingEntity else {
-            return
-        }
-        
-        guard let accessoryAnchor = getAccessoryAnchor(entity: sculptingEntity) else {
-            return
-        }
-        
-        if pressed {
-            Task { @MainActor in
-                displayToolbar(transform: sculptingTool.transform, accessoryAnchor: accessoryAnchor)
-            }
-        } else {
-            selectToolbarElement(sculptingEntity: sculptingEntity)
-            additiveIcon?.isEnabled = false
-            subtractiveIcon?.isEnabled = false
-            reduceIcon?.isEnabled = false
-            enlargeIcon?.isEnabled = false
-        }
+        guard pressed else { return }
+
+        additiveIcon?.isEnabled = false
+        subtractiveIcon?.isEnabled = false
+        reduceIcon?.isEnabled = false
+        enlargeIcon?.isEnabled = false
+        isSpatialToolbarPanelVisible.toggle()
     }
     
     // Show an indicator when tracking is non 6 DOF.
@@ -402,6 +404,17 @@ final class SculptingToolModel {
         }
 
         // --- Shaft collision detection ---
+        if isShaftCollisionDetectionSuspended, now >= shaftCollisionDetectionResumeTime {
+            isShaftCollisionDetectionSuspended = false
+            shaftCollisionDetectionResumeTime = .greatestFiniteMagnitude
+        }
+
+        let accessoryTrackingState = getAccessoryAnchor(entity: sculptingEntity)?.trackingState
+        let canRunShaftCollisionDetection =
+            !isShaftCollisionDetectionSuspended &&
+            collisionManager.hasSDFCache &&
+            accessoryTrackingState == .positionOrientationTracked
+
         // The shaft extends from the tip backward along the drill's local +Z axis
         // (the USDZ model body goes in +Z from the tip).
         let shaftAxis = (liveModelTransform?.rotation ?? liveToolTransform.rotation).act(SIMD3<Float>(0, 0, 1))
@@ -413,11 +426,21 @@ final class SculptingToolModel {
         if !collisionManager.hasSDFCache {
             collisionManager.scheduleRegeneration()
         }
-        let shaftResult = shaftCollisionDetector.test(
-            tipPosition: liveToolTransform.translation,
-            shaftDirection: shaftDirection,
-            collisionManager: collisionManager
-        )
+
+        let shaftResult: ShaftCollisionResult
+        if canRunShaftCollisionDetection {
+            shaftResult = shaftCollisionDetector.test(
+                tipPosition: liveToolTransform.translation,
+                shaftDirection: shaftDirection,
+                collisionManager: collisionManager
+            )
+        } else {
+            resetShaftCollisionStateIfNeeded()
+            shaftResult = ShaftCollisionResult(isColliding: false,
+                                               correctionVector: .zero,
+                                               collisionPoint: .zero,
+                                               penetrationDepth: 0)
+        }
 
         if shaftResult.isColliding {
             // DEBUG ONLY: Uncomment to visualize the temporary cylindrical shaft
@@ -617,6 +640,33 @@ final class SculptingToolModel {
     private func finishShaftRecovery() {
         isShaftRecovering = false
         reattachDrillOverlayToAnchor()
+    }
+
+    func suspendShaftCollisionDetection() {
+        isShaftCollisionDetectionSuspended = true
+        shaftCollisionDetectionResumeTime = .greatestFiniteMagnitude
+        resetShaftCollisionStateIfNeeded()
+    }
+
+    func resumeShaftCollisionDetection(after delay: TimeInterval) {
+        isShaftCollisionDetectionSuspended = true
+        shaftCollisionDetectionResumeTime = CACurrentMediaTime() + max(0, delay)
+        resetShaftCollisionStateIfNeeded()
+    }
+
+    func resetShaftCollisionStateIfNeeded() {
+        if isShaftFrozen || isShaftRecovering {
+            isShaftFrozen = false
+            isShaftRecovering = false
+        }
+        freezeEndTime = 0
+        recoveryStartTime = 0
+        restoreDrillMaterials()
+        restoreSculptMeshMaterials()
+        hapticsModel?.stopShaftCollisionFeedback()
+        if isDrillOverlayDetachedForFreeze {
+            reattachDrillOverlayToAnchor()
+        }
     }
 
     private func detachDrillOverlayFromAnchor(to root: Entity) {

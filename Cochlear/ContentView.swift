@@ -18,6 +18,8 @@ private enum ScenePerformanceTier: Equatable {
 }
 
 struct ContentView: View {
+    let experience: PreparedSculptExperience
+
     var root: Entity = Entity(components: [ComputeSystemComponent(computeSystem: SculptingToolSystem())])
     @State private var fluidSceneRoot: Entity = {
         let entity = Entity()
@@ -34,13 +36,30 @@ struct ContentView: View {
         entity.name = "InteractiveAnatomyRoot"
         return entity
     }()
+    @State private var accessorySceneRoot: Entity = {
+        let entity = Entity()
+        entity.name = "AccessorySceneRoot"
+        return entity
+    }()
+    @State private var spatialToolbarPanelRoot: Entity = {
+        let entity = Entity()
+        entity.name = "SpatialToolbarPanelRoot"
+        entity.position = SIMD3<Float>(0, 0, 0.35)
+        entity.scale = SIMD3<Float>(repeating: 0.63)
+        return entity
+    }()
 
     @State var sculpting: SculptingToolModel = SculptingToolModel()
     @State var haptics: HapticsModel = HapticsModel()
     @State var drillAudio: DrillAudioModel = DrillAudioModel()
 
-    let marchingCubesMesh: MarchingCubesMesh!
-    let sculptor: MarchingCubesMeshSculptor!
+    private var marchingCubesMesh: MarchingCubesMesh {
+        experience.marchingCubesMesh
+    }
+
+    private var sculptor: MarchingCubesMeshSculptor {
+        experience.sculptor
+    }
 
     @State var saveDocument: VolumeDocument? = nil
     @State var isSaving = false
@@ -70,73 +89,6 @@ struct ContentView: View {
     // Volume scale tracking: 1.0 = original size; each press changes by 0.1.
     // Minimum allowed = 0.4 (40% of original). Maximum = 1.0 (original size).
     @State private var volumeScaleFactor: Float = 1.0
-
-    // Build initial voxel volume from bundled package manifest when available.
-    private static func initialVolumeConfig() -> (dimensions: SIMD3<UInt32>,
-                                                  voxelSize: SIMD3<Float>,
-                                                  voxelStart: SIMD3<Float>,
-                                                  textureBoundsMin: SIMD3<Float>,
-                                                  textureBoundsMax: SIMD3<Float>) {
-        let fallbackDimensions = SIMD3<UInt32>(128, 128, 128)
-        let fallbackExtent = SIMD3<Float>(0.8, 0.8, 0.8)
-        let fallbackVoxelSize = fallbackExtent / SIMD3<Float>(fallbackDimensions)
-        let fallbackStart = -SIMD3<Float>(fallbackDimensions) * fallbackVoxelSize / 2
-        let fallbackBoundsMin = fallbackStart - fallbackVoxelSize * 0.5
-        let fallbackBoundsMax = fallbackStart + fallbackVoxelSize * (SIMD3<Float>(fallbackDimensions) - 0.5)
-        let targetVolumeSize: Float = 0.8
-
-        guard let url = Bundle.main.url(forResource: "MyVolume", withExtension: "sculptpkg") else {
-            print("Initial volume config: using fallback (missing MyVolume.sculptpkg).")
-            return (fallbackDimensions, fallbackVoxelSize, fallbackStart, fallbackBoundsMin, fallbackBoundsMax)
-        }
-        do {
-            let manifest = try VolumeDocument.parsePackageManifest(at: url)
-            let dims = SIMD3<UInt32>(UInt32(manifest.grid.width),
-                                     UInt32(manifest.grid.height),
-                                     UInt32(manifest.grid.depth))
-            guard manifest.bounds.min.count == 3, manifest.bounds.max.count == 3 else {
-                print("Initial volume config: manifest bounds invalid count; using fallback bounds.")
-                let voxelSize = fallbackExtent / SIMD3<Float>(dims)
-                let voxelStart = -SIMD3<Float>(dims) * voxelSize / 2
-                let boundsMin = voxelStart - voxelSize * 0.5
-                let boundsMax = voxelStart + voxelSize * (SIMD3<Float>(dims) - 0.5)
-                return (dims, voxelSize, voxelStart, boundsMin, boundsMax)
-            }
-
-            let bmin = SIMD3<Float>(manifest.bounds.min[0], manifest.bounds.min[1], manifest.bounds.min[2])
-            let bmax = SIMD3<Float>(manifest.bounds.max[0], manifest.bounds.max[1], manifest.bounds.max[2])
-            let sourceExtent = simd_max(bmax - bmin, SIMD3<Float>(repeating: 1e-5))
-            let maxExtent = max(sourceExtent.x, max(sourceExtent.y, sourceExtent.z))
-            let uniformScale = targetVolumeSize / max(maxExtent, 1e-5)
-            let fittedExtent = sourceExtent * uniformScale
-            let fittedMin = -fittedExtent * 0.5
-            let voxelSize = fittedExtent / SIMD3<Float>(dims)
-            let voxelStart = fittedMin + voxelSize * 0.5
-            print("Initial volume config from manifest: grid=\(dims), voxelSize=\(voxelSize)")
-            return (dims, voxelSize, voxelStart, bmin, bmax)
-        } catch {
-            print("Initial volume config: manifest parse failed, using fallback. Error: \(error)")
-            return (fallbackDimensions, fallbackVoxelSize, fallbackStart, fallbackBoundsMin, fallbackBoundsMax)
-        }
-    }
-
-    init() {
-        let config = Self.initialVolumeConfig()
-
-        guard let voxelVolume = try? VoxelVolume(dimensions: config.dimensions,
-                                                 voxelSize: config.voxelSize,
-                                                 voxelStartPosition: config.voxelStart,
-                                                 textureBoundsMin: config.textureBoundsMin,
-                                                 textureBoundsMax: config.textureBoundsMax) else {
-            self.marchingCubesMesh = nil
-            self.sculptor = nil
-            print("Failed to create volume.")
-            return
-        }
-
-        self.marchingCubesMesh = try? MarchingCubesMesh(voxelVolume: voxelVolume)
-        self.sculptor = MarchingCubesMeshSculptor(marchingCubesMesh: marchingCubesMesh)
-    }
 
     func createMeshChunkEntity(meshChunk: MarchingCubesMeshChunk) throws -> Entity {
         let mesh = try MeshResource(from: meshChunk.mesh)
@@ -171,25 +123,21 @@ struct ContentView: View {
 
             let entity = ModelEntity(mesh: meshResource, materials: [material])
             entity.name = "FluidLayer"
-            if let voxelVolume = marchingCubesMesh?.voxelVolume {
-                let dims = SIMD3<Float>(voxelVolume.dimensions)
-                let sculptMin = voxelVolume.voxelStartPosition - voxelVolume.voxelSize * 0.5
-                let sculptMax = voxelVolume.voxelStartPosition + voxelVolume.voxelSize * (dims - 0.5)
-                let sculptExtent = sculptMax - sculptMin
-                entity.position = SIMD3<Float>(
-                    (sculptMin.x + sculptMax.x) * 0.5,
-                    (sculptMin.y + sculptMax.y) * 0.5,
-                    sculptMax.z - 0.15
-                )
-                entity.scale = SIMD3<Float>(
-                    sculptExtent.x * 0.4032,
-                    1.0,
-                    sculptExtent.y * 0.4032
-                )
-            } else {
-                entity.position = SIMD3<Float>(0, 0, 0.23)
-                entity.scale = SIMD3<Float>(0.32256, 1.0, 0.32256)
-            }
+            let voxelVolume = marchingCubesMesh.voxelVolume
+            let dims = SIMD3<Float>(voxelVolume.dimensions)
+            let sculptMin = voxelVolume.voxelStartPosition - voxelVolume.voxelSize * 0.5
+            let sculptMax = voxelVolume.voxelStartPosition + voxelVolume.voxelSize * (dims - 0.5)
+            let sculptExtent = sculptMax - sculptMin
+            entity.position = SIMD3<Float>(
+                (sculptMin.x + sculptMax.x) * 0.5,
+                (sculptMin.y + sculptMax.y) * 0.5,
+                sculptMax.z - 0.15
+            )
+            entity.scale = SIMD3<Float>(
+                sculptExtent.x * 0.4032,
+                1.0,
+                sculptExtent.y * 0.4032
+            )
             entity.orientation = simd_quatf(angle: .pi / 2, axis: SIMD3<Float>(1, 0, 0))
             entity.isEnabled = !isFluidLayerHiddenForDebrisReset
             fluidSceneRoot.addChild(entity)
@@ -248,7 +196,7 @@ struct ContentView: View {
 
         var clampedPointInRoot = targetPointInRoot
         if let firstWaterCarveZInRoot {
-            clampedPointInRoot.z = min(firstWaterCarveZInRoot - 0.15, targetPointInRoot.z)
+            clampedPointInRoot.z = min(firstWaterCarveZInRoot - 0.20, targetPointInRoot.z)
         }
 
         let targetPointInFluid = fluidSceneRoot.convert(position: clampedPointInRoot, from: rootEntity)
@@ -256,7 +204,7 @@ struct ContentView: View {
     }
 
     private func sculptVolumeLocalBounds() -> (min: SIMD3<Float>, max: SIMD3<Float>)? {
-        guard let voxelVolume = marchingCubesMesh?.voxelVolume else { return nil }
+        let voxelVolume = marchingCubesMesh.voxelVolume
         let dims = SIMD3<Float>(voxelVolume.dimensions)
         let sculptMin = voxelVolume.voxelStartPosition - voxelVolume.voxelSize * 0.5
         let sculptMax = voxelVolume.voxelStartPosition + voxelVolume.voxelSize * (dims - 0.5)
@@ -395,6 +343,11 @@ struct ContentView: View {
         applySelectedBitSize()
     }
 
+    private func closeSpatialToolbarPanel() {
+        sculpting.isSpatialToolbarPanelVisible = false
+        spatialToolbarPanelRoot.isEnabled = false
+    }
+
     @ViewBuilder
     private func bitSizeButton(_ mm: Int) -> some View {
         Button("\(mm)mm") {
@@ -437,13 +390,10 @@ struct ContentView: View {
         guard sculpting.boneSlurryGrid == nil,
               !sculpting.boneDebrisManager.drawnEntities.isEmpty else { return }
 
-        if let voxelVolume = marchingCubesMesh?.voxelVolume {
-            let slurryBounds = slurryBounds(for: voxelVolume)
-            sculpting.replaceBoneSlurryGrid(volumeBoundsMin: slurryBounds.min,
-                                            volumeBoundsMax: slurryBounds.max)
-        } else {
-            sculpting.replaceBoneSlurryGrid()
-        }
+        let voxelVolume = marchingCubesMesh.voxelVolume
+        let slurryBounds = slurryBounds(for: voxelVolume)
+        sculpting.replaceBoneSlurryGrid(volumeBoundsMin: slurryBounds.min,
+                                        volumeBoundsMax: slurryBounds.max)
         applyPerformanceGovernor()
     }
 
@@ -618,14 +568,22 @@ struct ContentView: View {
             if fluidSceneRoot.parent == nil {
                 content.add(fluidSceneRoot)
             }
+            if accessorySceneRoot.parent == nil {
+                content.add(accessorySceneRoot)
+            }
+            if spatialToolbarPanelRoot.parent == nil {
+                spatialToolbarPanelRoot.position = SIMD3<Float>(0, 0, 0.35)
+                spatialToolbarPanelRoot.scale = SIMD3<Float>(repeating: 0.63)
+                spatialToolbarPanelRoot.orientation = simd_quatf()
+                spatialToolbarPanelRoot.isEnabled = sculpting.isSpatialToolbarPanelVisible
+                content.add(spatialToolbarPanelRoot)
+            }
             sculpting.registerAnatomyEffectsRoot(interactiveAnatomyRoot)
 
             // Create an entity to render each mesh chunk.
-            if let meshChunks = marchingCubesMesh?.meshChunks {
-                for meshChunk in meshChunks {
-                    if let meshChunkEntity = try? createMeshChunkEntity(meshChunk: meshChunk) {
-                        root.addChild(meshChunkEntity)
-                    }
+            for meshChunk in marchingCubesMesh.meshChunks {
+                if let meshChunkEntity = try? createMeshChunkEntity(meshChunk: meshChunk) {
+                    root.addChild(meshChunkEntity)
                 }
             }
 
@@ -647,18 +605,14 @@ struct ContentView: View {
 
             content.add(root)
             sculpting.rootEntity = root
+            sculpting.accessoryRootEntity = accessorySceneRoot
 
             // Set up the bone debris manager with the root entity and SDF access.
-            if let voxelVolume = marchingCubesMesh?.voxelVolume {
-                sculpting.boneDebrisManager.setup(rootEntity: root, voxelVolume: voxelVolume)
-            } else {
-                sculpting.boneDebrisManager.setup(rootEntity: root)
-            }
+            sculpting.boneDebrisManager.setup(rootEntity: root, voxelVolume: marchingCubesMesh.voxelVolume)
 
             // Set up the collision manager with direct SDF access.
-            if let voxelVolume = marchingCubesMesh?.voxelVolume {
-                sculpting.collisionManager.setup(rootEntity: root, voxelVolume: voxelVolume)
-            }
+            sculpting.collisionManager.setup(rootEntity: root, voxelVolume: marchingCubesMesh.voxelVolume)
+            sculpting.suspendShaftCollisionDetection()
             applyPerformanceGovernor()
 
             // Update sculpting tool and check for tracking quality each frame.
@@ -677,6 +631,10 @@ struct ContentView: View {
                 sculpting.updateSculptingTool()
                 createFluidLayerIfNeeded()
                 updateFluidLayer(timestep: event.deltaTime)
+                spatialToolbarPanelRoot.position = SIMD3<Float>(0, 0, 0.35)
+                spatialToolbarPanelRoot.scale = SIMD3<Float>(repeating: 0.63)
+                spatialToolbarPanelRoot.orientation = simd_quatf()
+                spatialToolbarPanelRoot.isEnabled = sculpting.isSpatialToolbarPanelVisible
             }
 
             if let additiveAttachment = attachments.entity(for: "Additive") {
@@ -699,6 +657,14 @@ struct ContentView: View {
                 sculpting.reduceIcon = reduceAttachment
             }
 
+            if let stylusToolbarAttachment = attachments.entity(for: "StylusToolbarPanel") {
+                if stylusToolbarAttachment.parent == nil {
+                    stylusToolbarAttachment.position = .zero
+                    stylusToolbarAttachment.name = "StylusToolbarPanel"
+                    spatialToolbarPanelRoot.addChild(stylusToolbarAttachment)
+                }
+            }
+
             // Iterate over all the currently connected supported spatial accessories.
             // Also, handle notifications of incoming connections.
             await sculpting.handleGameControllerSetup(hapticsModel: haptics)
@@ -717,6 +683,10 @@ struct ContentView: View {
 
             Attachment(id: "Reduce") {
                 ToolbarElement(name: "Reduce")
+            }
+
+            Attachment(id: "StylusToolbarPanel") {
+                spatialToolbarPanelAttachment()
             }
         }.task {
             // Get transforms of accessories in the app process.
@@ -763,6 +733,7 @@ struct ContentView: View {
 
     @MainActor
     private func performReload() {
+        sculpting.suspendShaftCollisionDetection()
         do {
             // Load a packaged sculpt volume from app bundle.
             try sculpting.loadBundledPackage(named: "MyVolume")
@@ -771,6 +742,7 @@ struct ContentView: View {
             if sculpting.sculptingEntity != nil {
                 sculpting.collisionManager.scheduleRegeneration()
             }
+            sculpting.resumeShaftCollisionDetection(after: 1.0)
         } catch {
             // Fallback to legacy .volume file.
             if let url = Bundle.main.url(forResource: "MyModel", withExtension: "volume") {
@@ -781,11 +753,14 @@ struct ContentView: View {
                     if sculpting.sculptingEntity != nil {
                         sculpting.collisionManager.scheduleRegeneration()
                     }
+                    sculpting.resumeShaftCollisionDetection(after: 1.0)
                 } catch {
                     print("Failed to open document: \(error)")
+                    sculpting.resumeShaftCollisionDetection(after: 0)
                 }
             } else {
                 print("Failed to open bundled package: \(error)")
+                sculpting.resumeShaftCollisionDetection(after: 0)
             }
         }
     }
@@ -865,6 +840,120 @@ struct ContentView: View {
         waterProbeController.isDebugVisible = isEnabled
     }
 
+    private func spatialToolbarButton(_ title: String,
+                                      isActive: Bool = false,
+                                      action: @escaping () -> Void) -> some View {
+        Button(title) {
+            action()
+            closeSpatialToolbarPanel()
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(isActive ? .green : .gray)
+    }
+
+    @ViewBuilder
+    private func spatialToolbarPanelAttachment() -> some View {
+        ZStack {
+            Color.black.opacity(0.001)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    closeSpatialToolbarPanel()
+                }
+
+            VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Drill Bit Size")
+                        .font(.caption)
+                    HStack {
+                        spatialToolbarButton("6mm", isActive: selectedBitSizeMM == 6) {
+                            setBitSize(mm: 6)
+                        }
+                        spatialToolbarButton("4mm", isActive: selectedBitSizeMM == 4) {
+                            setBitSize(mm: 4)
+                        }
+                        spatialToolbarButton("2mm", isActive: selectedBitSizeMM == 2) {
+                            setBitSize(mm: 2)
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Zoom")
+                        .font(.caption)
+                    HStack {
+                        spatialToolbarButton("1.0x", isActive: abs(sceneZoomFactor - 1.0) < 0.001) {
+                            applySceneZoom(1.0)
+                        }
+                        spatialToolbarButton("1.5x", isActive: abs(sceneZoomFactor - 1.5) < 0.001) {
+                            applySceneZoom(1.5)
+                        }
+                        spatialToolbarButton("2.0x", isActive: abs(sceneZoomFactor - 2.0) < 0.001) {
+                            applySceneZoom(2.0)
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Camera Pos")
+                        .font(.caption)
+                    HStack {
+                        spatialToolbarButton("+45 deg") {
+                            applySceneWideRollIncrement(radians: 45 * (.pi / 180))
+                        }
+                        spatialToolbarButton("-45 deg") {
+                            applySceneWideRollIncrement(radians: -45 * (.pi / 180))
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("General")
+                        .font(.caption)
+                    HStack {
+                        spatialToolbarButton("Reload") {
+                            performReload()
+                        }
+                        spatialToolbarButton("Clear Debris") {
+                            handleClearDebris()
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Debug")
+                        .font(.caption)
+                    HStack {
+                        spatialToolbarButton("Xray", isActive: isVolumeTransparent) {
+                            isVolumeTransparent.toggle()
+                            applyVolumeTransparency(isVolumeTransparent)
+                        }
+                        spatialToolbarButton("Slurry Grid", isActive: isSlurryDebugUIEnabled) {
+                            setSlurryDebugEnabled(!isSlurryDebugUIEnabled)
+                        }
+                        spatialToolbarButton("Water Pos", isActive: isWaterDebugUIEnabled) {
+                            setWaterDebugEnabled(!isWaterDebugUIEnabled)
+                        }
+                    }
+                }
+
+                HStack {
+                    spatialToolbarButton("Rot X") {
+                        rotateVolume(axis: SIMD3<Float>(1, 0, 0))
+                    }
+                    spatialToolbarButton("Rot Y") {
+                        rotateVolume(axis: SIMD3<Float>(0, 1, 0))
+                    }
+                    spatialToolbarButton("Rot Z") {
+                        rotateVolume(axis: SIMD3<Float>(0, 0, 1))
+                    }
+                }
+            }
+            .padding()
+            .glassBackgroundEffect()
+        }
+        .frame(width: 1600, height: 1000)
+    }
+
     func slurryDebugButton() -> some View {
         Button {
             setSlurryDebugEnabled(!isSlurryDebugUIEnabled)
@@ -890,13 +979,10 @@ struct ContentView: View {
         sculpting.sculptingTool.components[SculptingToolComponent.self]?.previousPosition = nil
         resetFluidAccumulation()
 
-        if let voxelVolume = marchingCubesMesh?.voxelVolume {
-            let slurryBounds = slurryBounds(for: voxelVolume)
-            sculpting.replaceBoneSlurryGrid(volumeBoundsMin: slurryBounds.min,
-                                            volumeBoundsMax: slurryBounds.max)
-        } else {
-            sculpting.replaceBoneSlurryGrid()
-        }
+        let voxelVolume = marchingCubesMesh.voxelVolume
+        let slurryBounds = slurryBounds(for: voxelVolume)
+        sculpting.replaceBoneSlurryGrid(volumeBoundsMin: slurryBounds.min,
+                                        volumeBoundsMax: slurryBounds.max)
     }
 
     func toggleGravityButton() -> some View {
@@ -1005,66 +1091,7 @@ struct ContentView: View {
     //Final Consolidated View
     var body: some View {
         ZStack {
-
-            //Sculpt Volume
             sculptingVolume()
-                .ornament(attachmentAnchor: .scene(.bottomFront)) {
-                    VStack {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("Bit Size")
-                                .font(.caption)
-                            HStack {
-                                bitSizeButton(6)
-                                bitSizeButton(4)
-                                bitSizeButton(2)
-                            }
-                        }
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("Zoom")
-                                .font(.caption)
-                            HStack {
-                                zoomButton(1.0)
-                                zoomButton(1.5)
-                                zoomButton(2.0)
-                            }
-                        }
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("Camera Rotation")
-                                .font(.caption)
-                            HStack {
-                                cameraRollButton(45)
-                                cameraRollButton(-45)
-                            }
-                        }
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("General")
-                                .font(.caption)
-                            HStack {
-                                openButton()
-                                clearDebrisButton()
-                            }
-                        }
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("Debug")
-                                .font(.caption2)
-                            HStack {
-                                toggleTransparencyButton()
-                                slurryDebugButton()
-                                waterDebugButton()
-                            }
-                            HStack {
-                                rotateXButton()
-                                rotateYButton()
-                                rotateZButton()
-                            }
-                            HStack {
-                                shrinkVolumeButton()
-                                growVolumeButton()
-                            }
-                        }
-                    }.padding().glassBackgroundEffect()
-                }
-            //end Sculpting Volume
         }
     }
 }

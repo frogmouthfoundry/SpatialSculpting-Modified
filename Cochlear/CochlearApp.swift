@@ -9,6 +9,7 @@ import SwiftUI
 
 @main
 struct CochlearApp: App {
+    @State private var appModel = AppFlowModel()
 
     init() {
         ComputeDispatchSystem.registerSystem()
@@ -16,9 +17,23 @@ struct CochlearApp: App {
     }
     
     var body: some Scene {
-        WindowGroup {
-            ContentView().frame(width: 1500, height: 1500).frame(depth: 1500)
+        WindowGroup(id: AppWindowID.onboarding) {
+            LaunchExperienceView(appModel: appModel)
+        }
+        .windowResizability(.contentSize)
+        .defaultLaunchBehavior(.presented)
+
+        WindowGroup(id: AppWindowID.contentExperience) {
+            if let preparedExperience = appModel.preparedExperience {
+                ContentView(experience: preparedExperience)
+                    .frame(width: 1500, height: 1500)
+                    .frame(depth: 1500)
+            } else {
+                ProgressView("Preparing")
+                    .frame(width: 420, height: 220)
+            }
         }
         .windowStyle(.volumetric)
+        .defaultLaunchBehavior(.suppressed)
     }
 }

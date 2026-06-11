@@ -75,6 +75,9 @@ extension SculptingToolModel {
         }
 
         // Listen to notifications for connections of both controllers and styluses.
+        guard !didRegisterAccessoryNotifications else { return }
+        didRegisterAccessoryNotifications = true
+
         NotificationCenter.default.addObserver(forName: NSNotification.Name.GCControllerDidConnect, object: nil, queue: nil) {
             notification in
                 if let controller = notification.object as? GCController,
@@ -91,6 +94,24 @@ extension SculptingToolModel {
                stylus.productCategory == GCProductCategorySpatialStylus {
                 Task { @MainActor in
                     try? await self.setupSpatialAccessory(device: stylus, hapticsModel: hapticsModel)
+                }
+            }
+        }
+
+        NotificationCenter.default.addObserver(forName: NSNotification.Name.GCControllerDidDisconnect, object: nil, queue: nil) {
+            notification in
+            if let controller = notification.object as? GCController {
+                Task { @MainActor in
+                    self.removeSpatialAccessoryAnchor(for: ObjectIdentifier(controller))
+                }
+            }
+        }
+
+        NotificationCenter.default.addObserver(forName: NSNotification.Name.GCStylusDidDisconnect, object: nil, queue: nil) {
+            notification in
+            if let stylus = notification.object as? GCStylus {
+                Task { @MainActor in
+                    self.removeSpatialAccessoryAnchor(for: ObjectIdentifier(stylus))
                 }
             }
         }
