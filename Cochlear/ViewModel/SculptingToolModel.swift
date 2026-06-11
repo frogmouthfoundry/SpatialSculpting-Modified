@@ -98,6 +98,7 @@ final class SculptingToolModel {
     var drillModelDefaultLocalTransform: Transform? = nil
     var drillBallDefaultLocalTransform: Transform? = nil
     private var lastTrackingAudioState: AccessoryAnchor.TrackingState? = nil
+    private(set) var isCurrentlyCarving: Bool = false
 
     // Tracks carving state for logging and particle bursts
     private var wasCarving: Bool = false
@@ -515,6 +516,7 @@ final class SculptingToolModel {
         sculptingTool.components[SculptingToolComponent.self]?.isActive = !carvingBlocked
 
         if carvingBlocked {
+            isCurrentlyCarving = false
             hapticsModel?.stopSculptVibration()
             updateDrillCarvingAudio(isCarving: false)
             carvingFrameStreak = 0
@@ -534,6 +536,7 @@ final class SculptingToolModel {
             let isCarving = updateCarvingState(sampledSDF: sdf,
                                                toolRadius: sculptingToolComponent.radius,
                                                isToolActive: sculptingToolComponent.isActive)
+            isCurrentlyCarving = isCarving
             if isCarving != wasCarving {
                 print(isCarving ? "[Drill] Carving" : "[Drill] Idle")
                 if isCarving {
@@ -563,6 +566,8 @@ final class SculptingToolModel {
             if isCarving {
                 collisionManager.markDirty()
             }
+        } else {
+            isCurrentlyCarving = false
         }
         
         /*

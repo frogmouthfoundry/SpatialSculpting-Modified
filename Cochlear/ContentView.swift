@@ -46,16 +46,23 @@ struct ContentView: View {
     @State var isSaving = false
     @State private var fluidWaveMesh: AnimatedWaveMesh? = nil
     @State private var fluidWaveEntity: ModelEntity? = nil
+    @State private var defaultFluidLayerPosition: SIMD3<Float>? = nil
+    @State private var waterProbeController: VirtualWaterProbeController = VirtualWaterProbeController(radius: 0.008)
+    @State private var fluidRevealDebrisThreshold: Int = 6
+    @State private var firstWaterCarveZInRoot: Float? = nil
     @State private var lastFluidRippleTimestamp: TimeInterval = 0
-    @State private var isFluidLayerHiddenForDebrisReset: Bool = false
+    @State private var isFluidLayerHiddenForDebrisReset: Bool = true
     @State private var selectedBitSizeMM: Int = 6
     @State private var didApplyBitSizeToDrillBall: Bool = false
     @State private var didLoadStaticSceneContent: Bool = false
     @State private var didLoadInteractiveAnatomyContent: Bool = false
     @State private var didQueueDeferredStartupWork: Bool = false
+    @State private var didScheduleStartupReload: Bool = false
     @State private var isSlurryDebugUIEnabled: Bool = false
+    @State private var isWaterDebugUIEnabled: Bool = false
     @State private var sceneZoomFactor: Float = 1.0
     @State private var scenePerformanceTier: ScenePerformanceTier = .normal
+    @State private var sceneRollAngleRadians: Float = 0
 
     // Volume transparency toggle (50% transparent when on).
     @State private var isVolumeTransparent: Bool = false
@@ -189,6 +196,7 @@ struct ContentView: View {
 
             fluidWaveMesh = waveMesh
             fluidWaveEntity = entity
+            defaultFluidLayerPosition = entity.position
             applyPerformanceGovernor()
         } catch {
             print("Failed to create fluid layer: \(error)")
@@ -199,8 +207,9 @@ struct ContentView: View {
         if fluidWaveMesh?.needsFrameUpdate == true {
             fluidWaveMesh?.update(timestep)
         }
+        updateVirtualWaterProbe(timestep: timestep)
         if isFluidLayerHiddenForDebrisReset,
-           sculpting.boneDebrisManager.spawnedDebrisSinceLastClear >= 10 {
+           sculpting.boneDebrisManager.spawnedDebrisSinceLastClear >= fluidRevealDebrisThreshold {
             setFluidLayerVisible(true)
             isFluidLayerHiddenForDebrisReset = false
         }
@@ -209,6 +218,41 @@ struct ContentView: View {
 
     private func setFluidLayerVisible(_ isVisible: Bool) {
         fluidWaveEntity?.isEnabled = isVisible
+    }
+
+    private func resetFluidAccumulation() {
+        waterProbeController.reset()
+        firstWaterCarveZInRoot = nil
+        if let defaultFluidLayerPosition {
+            fluidWaveEntity?.position = defaultFluidLayerPosition
+        }
+        setFluidLayerVisible(false)
+        isFluidLayerHiddenForDebrisReset = true
+    }
+
+    private func updateVirtualWaterProbe(timestep: TimeInterval) {
+        guard let rootEntity = sculpting.rootEntity else { return }
+
+        let carvePositionInRoot: SIMD3<Float>? = sculpting.isCurrentlyCarving ? sculpting.sculptingTool.position : nil
+        if let carvePositionInRoot, firstWaterCarveZInRoot == nil {
+            firstWaterCarveZInRoot = carvePositionInRoot.z
+        }
+        waterProbeController.update(rootEntity: rootEntity,
+                                    collisionManager: sculpting.collisionManager,
+                                    carvePositionInRoot: carvePositionInRoot,
+                                    isCarving: sculpting.isCurrentlyCarving,
+                                    timestep: timestep)
+
+        guard let fluidWaveEntity,
+              let targetPointInRoot = waterProbeController.waterPlacementPointInRoot else { return }
+
+        var clampedPointInRoot = targetPointInRoot
+        if let firstWaterCarveZInRoot {
+            clampedPointInRoot.z = min(firstWaterCarveZInRoot - 0.15, targetPointInRoot.z)
+        }
+
+        let targetPointInFluid = fluidSceneRoot.convert(position: clampedPointInRoot, from: rootEntity)
+        fluidWaveEntity.position.z = targetPointInFluid.z
     }
 
     private func sculptVolumeLocalBounds() -> (min: SIMD3<Float>, max: SIMD3<Float>)? {
@@ -302,6 +346,31 @@ struct ContentView: View {
         fluidSceneRoot.transform = Transform()
     }
 
+    private func updateRootGravityFromCurrentRotation() {
+        let worldGravity = BoneDebrisManager.debrisGravity
+        let inverseRotation = root.transform.rotation.inverse
+        let localGravity = inverseRotation.act(worldGravity)
+        var sim = root.components[PhysicsSimulationComponent.self] ?? PhysicsSimulationComponent()
+        sim.gravity = localGravity
+        root.components.set(sim)
+    }
+
+    private func applySceneWideRollIncrement(radians: Float, updateState: Bool = true) {
+        guard abs(radians) > 0.0001 else { return }
+
+        let increment = simd_quatf(angle: radians, axis: SIMD3<Float>(0, 0, 1))
+        root.transform.rotation = increment * root.transform.rotation
+        staticSceneRoot.transform.rotation = increment * staticSceneRoot.transform.rotation
+        interactiveAnatomyRoot.transform.rotation = increment * interactiveAnatomyRoot.transform.rotation
+        fluidSceneRoot.transform.rotation = increment * fluidSceneRoot.transform.rotation
+
+        if updateState {
+            sceneRollAngleRadians += radians
+        }
+
+        updateRootGravityFromCurrentRotation()
+    }
+
     private var selectedBitRadiusMeters: Float {
         Float(selectedBitSizeMM) / 1000.0
     }
@@ -350,6 +419,7 @@ struct ContentView: View {
 
     private func triggerFluidRippleIfNeeded() {
         guard let waveMesh = fluidWaveMesh, let fluidEntity = fluidWaveEntity else { return }
+        guard fluidEntity.isEnabled else { return }
         let toolPositionInFluidSpace = fluidEntity.convert(position: sculpting.sculptingTool.position, from: root)
         guard abs(toolPositionInFluidSpace.x) < 0.5,
               abs(toolPositionInFluidSpace.y) < 0.5,
@@ -440,6 +510,17 @@ struct ContentView: View {
             try? await Task.sleep(for: .milliseconds(100))
             sculpting.preloadBoneDust()
             sculpting.preloadBloodSpurt()
+        }
+    }
+
+    @MainActor
+    private func scheduleStartupReloadIfNeeded() {
+        guard !didScheduleStartupReload else { return }
+        didScheduleStartupReload = true
+
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(250))
+            performReload()
         }
     }
 
@@ -584,6 +665,7 @@ struct ContentView: View {
             _ = content.subscribe(to: SceneEvents.Update.self) {
                 event in
                 queueDeferredStartupWorkIfNeeded()
+                scheduleStartupReloadIfNeeded()
                 if sculpting.shouldClearDebris {
                     sculpting.shouldClearDebris = false
                     handleClearDebris()
@@ -673,37 +755,46 @@ struct ContentView: View {
 
     func openButton() -> some View {
         Button {
-            do {
-                // Load a packaged sculpt volume from app bundle.
-                try sculpting.loadBundledPackage(named: "MyVolume")
-                applyLoadedVolumePresentationTransform()
-                if sculpting.sculptingEntity != nil {
-                    sculpting.collisionManager.scheduleRegeneration()
-                }
-            } catch {
-                // Fallback to legacy .volume file.
-                if let url = Bundle.main.url(forResource: "MyModel", withExtension: "volume") {
-                    do {
-                        try sculpting.loadFromURL(url)
-                        applyLoadedVolumePresentationTransform()
-                        if sculpting.sculptingEntity != nil {
-                            sculpting.collisionManager.scheduleRegeneration()
-                        }
-                    } catch {
-                        print("Failed to open document: \(error)")
-                    }
-                } else {
-                    print("Failed to open bundled package: \(error)")
-                }
-            }
+            performReload()
         } label: {
-            Text("Load")
+            Text("Reload")
+        }
+    }
+
+    @MainActor
+    private func performReload() {
+        do {
+            // Load a packaged sculpt volume from app bundle.
+            try sculpting.loadBundledPackage(named: "MyVolume")
+            applyLoadedVolumePresentationTransform()
+            resetFluidAccumulation()
+            if sculpting.sculptingEntity != nil {
+                sculpting.collisionManager.scheduleRegeneration()
+            }
+        } catch {
+            // Fallback to legacy .volume file.
+            if let url = Bundle.main.url(forResource: "MyModel", withExtension: "volume") {
+                do {
+                    try sculpting.loadFromURL(url)
+                    applyLoadedVolumePresentationTransform()
+                    resetFluidAccumulation()
+                    if sculpting.sculptingEntity != nil {
+                        sculpting.collisionManager.scheduleRegeneration()
+                    }
+                } catch {
+                    print("Failed to open document: \(error)")
+                }
+            } else {
+                print("Failed to open bundled package: \(error)")
+            }
         }
     }
 
     private func applyLoadedVolumePresentationTransform() {
         let preservedZoomFactor = sceneZoomFactor
+        let preservedRollAngle = sceneRollAngleRadians
         sceneZoomFactor = 1.0
+        sceneRollAngleRadians = 0
         resetZoomedSceneTransformsToBaseline()
         root.transform.rotation = simd_quatf(angle: (.pi * 3.0) / 2.0, axis: SIMD3<Float>(0, 1, 0))
         volumeScaleFactor = 0.75
@@ -711,13 +802,11 @@ struct ContentView: View {
         if abs(preservedZoomFactor - 1.0) > 0.0001 {
             applySceneZoom(preservedZoomFactor)
         }
-
-        let worldGravity = BoneDebrisManager.debrisGravity
-        let inverseRotation = root.transform.rotation.inverse
-        let localGravity = inverseRotation.act(worldGravity)
-        var sim = root.components[PhysicsSimulationComponent.self] ?? PhysicsSimulationComponent()
-        sim.gravity = localGravity
-        root.components.set(sim)
+        if abs(preservedRollAngle) > 0.0001 {
+            applySceneWideRollIncrement(radians: preservedRollAngle)
+        } else {
+            updateRootGravityFromCurrentRotation()
+        }
     }
 
     func clearButton() -> some View {
@@ -771,21 +860,35 @@ struct ContentView: View {
         }
     }
 
+    private func setWaterDebugEnabled(_ isEnabled: Bool) {
+        isWaterDebugUIEnabled = isEnabled
+        waterProbeController.isDebugVisible = isEnabled
+    }
+
     func slurryDebugButton() -> some View {
         Button {
             setSlurryDebugEnabled(!isSlurryDebugUIEnabled)
         } label: {
-            Text(isSlurryDebugUIEnabled ? "Slurry Debug ON" : "Slurry Debug Off")
+            Text(isSlurryDebugUIEnabled ? "Slurry Grid ON" : "Slurry Grid Off")
         }
         .buttonStyle(.borderedProminent)
         .tint(isSlurryDebugUIEnabled ? .green : .gray)
     }
 
+    func waterDebugButton() -> some View {
+        Button {
+            setWaterDebugEnabled(!isWaterDebugUIEnabled)
+        } label: {
+            Text(isWaterDebugUIEnabled ? "Water Pos ON" : "Water Pos Off")
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(isWaterDebugUIEnabled ? .green : .gray)
+    }
+
     private func handleClearDebris() {
         sculpting.boneDebrisManager.clearAllDebris()
         sculpting.sculptingTool.components[SculptingToolComponent.self]?.previousPosition = nil
-        setFluidLayerVisible(false)
-        isFluidLayerHiddenForDebrisReset = true
+        resetFluidAccumulation()
 
         if let voxelVolume = marchingCubesMesh?.voxelVolume {
             let slurryBounds = slurryBounds(for: voxelVolume)
@@ -820,13 +923,7 @@ struct ContentView: View {
         let increment = simd_quatf(angle: .pi / 2, axis: normalize(axis))
         root.transform.rotation = increment * root.transform.rotation
 
-        // Express the desired world-space gravity in the root's new local space.
-        let worldGravity = BoneDebrisManager.debrisGravity
-        let inverseRotation = root.transform.rotation.inverse
-        let localGravity = inverseRotation.act(worldGravity)
-        var sim = root.components[PhysicsSimulationComponent.self] ?? PhysicsSimulationComponent()
-        sim.gravity = localGravity
-        root.components.set(sim)
+        updateRootGravityFromCurrentRotation()
     }
 
     func rotateXButton() -> some View {
@@ -839,6 +936,15 @@ struct ContentView: View {
 
     func rotateZButton() -> some View {
         Button { rotateVolume(axis: SIMD3<Float>(0, 0, 1)) } label: { Text("Rot Z") }
+    }
+
+    func cameraRollButton(_ degrees: Float) -> some View {
+        let label = degrees > 0 ? "+45 deg" : "-45 deg"
+        return Button {
+            applySceneWideRollIncrement(radians: degrees * (.pi / 180))
+        } label: {
+            Text(label)
+        }
     }
 
     // MARK: - Volume Transparency
@@ -860,8 +966,10 @@ struct ContentView: View {
             isVolumeTransparent.toggle()
             applyVolumeTransparency(isVolumeTransparent)
         } label: {
-            Text(isVolumeTransparent ? "Opaque" : "Transparent")
+            Text(isVolumeTransparent ? "Xray ON" : "Xray Off")
         }
+        .buttonStyle(.borderedProminent)
+        .tint(isVolumeTransparent ? .green : .gray)
     }
 
     // MARK: - Volume Scale
@@ -902,10 +1010,6 @@ struct ContentView: View {
             sculptingVolume()
                 .ornament(attachmentAnchor: .scene(.bottomFront)) {
                     VStack {
-                        HStack {
-                            openButton()
-                            clearDebrisButton()
-                        }
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Bit Size")
                                 .font(.caption)
@@ -925,11 +1029,28 @@ struct ContentView: View {
                             }
                         }
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("Debug Mode")
+                            Text("Camera Rotation")
                                 .font(.caption)
+                            HStack {
+                                cameraRollButton(45)
+                                cameraRollButton(-45)
+                            }
+                        }
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("General")
+                                .font(.caption)
+                            HStack {
+                                openButton()
+                                clearDebrisButton()
+                            }
+                        }
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Debug")
+                                .font(.caption2)
                             HStack {
                                 toggleTransparencyButton()
                                 slurryDebugButton()
+                                waterDebugButton()
                             }
                             HStack {
                                 rotateXButton()
