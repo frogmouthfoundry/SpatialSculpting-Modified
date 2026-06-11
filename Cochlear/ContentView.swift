@@ -19,8 +19,9 @@ private enum ScenePerformanceTier: Equatable {
 
 struct ContentView: View {
     let experience: PreparedSculptExperience
+    @Environment(\.scenePhase) private var scenePhase
 
-    var root: Entity = Entity(components: [ComputeSystemComponent(computeSystem: SculptingToolSystem())])
+    @State private var root: Entity = Entity(components: [ComputeSystemComponent(computeSystem: SculptingToolSystem())])
     @State private var fluidSceneRoot: Entity = {
         let entity = Entity()
         entity.name = "FluidSceneRoot"
@@ -68,7 +69,8 @@ struct ContentView: View {
     @State private var defaultFluidLayerPosition: SIMD3<Float>? = nil
     @State private var waterProbeController: VirtualWaterProbeController = VirtualWaterProbeController(radius: 0.008)
     @State private var fluidRevealDebrisThreshold: Int = 6
-    @State private var firstWaterCarveZInRoot: Float? = nil
+    @State private var waterPlacementZClampInFluidSpace: Float? = nil
+    @State private var waterProbeAccumulatedTime: TimeInterval = 0
     @State private var lastFluidRippleTimestamp: TimeInterval = 0
     @State private var isFluidLayerHiddenForDebrisReset: Bool = true
     @State private var selectedBitSizeMM: Int = 6
@@ -82,6 +84,9 @@ struct ContentView: View {
     @State private var sceneZoomFactor: Float = 1.0
     @State private var scenePerformanceTier: ScenePerformanceTier = .normal
     @State private var sceneRollAngleRadians: Float = 0
+    @State private var sceneUpdateSubscription: EventSubscription? = nil
+    @State private var hasActivatedContentScene: Bool = false
+    @State private var isContentSceneActive: Bool = false
 
     // Volume transparency toggle (50% transparent when on).
     @State private var isVolumeTransparent: Bool = false
@@ -131,7 +136,7 @@ struct ContentView: View {
             entity.position = SIMD3<Float>(
                 (sculptMin.x + sculptMax.x) * 0.5,
                 (sculptMin.y + sculptMax.y) * 0.5,
-                sculptMax.z - 0.15
+                sculptMax.z - 0.08
             )
             entity.scale = SIMD3<Float>(
                 sculptExtent.x * 0.4032,
@@ -155,7 +160,13 @@ struct ContentView: View {
         if fluidWaveMesh?.needsFrameUpdate == true {
             fluidWaveMesh?.update(timestep)
         }
-        updateVirtualWaterProbe(timestep: timestep)
+        waterProbeAccumulatedTime += timestep
+        let waterProbeUpdateInterval = 1.0 / 30.0
+        if waterProbeAccumulatedTime >= waterProbeUpdateInterval {
+            let probeTimestep = waterProbeAccumulatedTime
+            waterProbeAccumulatedTime = 0
+            updateVirtualWaterProbe(timestep: probeTimestep)
+        }
         if isFluidLayerHiddenForDebrisReset,
            sculpting.boneDebrisManager.spawnedDebrisSinceLastClear >= fluidRevealDebrisThreshold {
             setFluidLayerVisible(true)
@@ -168,22 +179,46 @@ struct ContentView: View {
         fluidWaveEntity?.isEnabled = isVisible
     }
 
-    private func resetFluidAccumulation() {
+    private func hideFluidLayerForDebrisReset() {
+        setFluidLayerVisible(false)
+        isFluidLayerHiddenForDebrisReset = true
+    }
+
+    private func resetFluidAccumulationForReload() {
         waterProbeController.reset()
-        firstWaterCarveZInRoot = nil
+        waterPlacementZClampInFluidSpace = nil
+        waterProbeAccumulatedTime = 0
         if let defaultFluidLayerPosition {
             fluidWaveEntity?.position = defaultFluidLayerPosition
         }
-        setFluidLayerVisible(false)
-        isFluidLayerHiddenForDebrisReset = true
+        hideFluidLayerForDebrisReset()
+    }
+
+    private func replaceSlurryGridForCurrentVolume() {
+        let voxelVolume = marchingCubesMesh.voxelVolume
+        let slurryBounds = slurryBounds(for: voxelVolume)
+        sculpting.replaceBoneSlurryGrid(volumeBoundsMin: slurryBounds.min,
+                                        volumeBoundsMax: slurryBounds.max)
+    }
+
+    private func performDebrisReset(resetWaterProbeForReload: Bool) {
+        sculpting.boneDebrisManager.clearAllDebris()
+        sculpting.sculptingTool.components[SculptingToolComponent.self]?.previousPosition = nil
+        if resetWaterProbeForReload {
+            resetFluidAccumulationForReload()
+        } else {
+            hideFluidLayerForDebrisReset()
+        }
+        replaceSlurryGridForCurrentVolume()
     }
 
     private func updateVirtualWaterProbe(timestep: TimeInterval) {
         guard let rootEntity = sculpting.rootEntity else { return }
 
         let carvePositionInRoot: SIMD3<Float>? = sculpting.isCurrentlyCarving ? sculpting.sculptingTool.position : nil
-        if let carvePositionInRoot, firstWaterCarveZInRoot == nil {
-            firstWaterCarveZInRoot = carvePositionInRoot.z
+        if let carvePositionInRoot, waterPlacementZClampInFluidSpace == nil {
+            let carvePositionInFluid = fluidSceneRoot.convert(position: carvePositionInRoot, from: rootEntity)
+            waterPlacementZClampInFluidSpace = carvePositionInFluid.z - 0.06
         }
         waterProbeController.update(rootEntity: rootEntity,
                                     collisionManager: sculpting.collisionManager,
@@ -194,12 +229,10 @@ struct ContentView: View {
         guard let fluidWaveEntity,
               let targetPointInRoot = waterProbeController.waterPlacementPointInRoot else { return }
 
-        var clampedPointInRoot = targetPointInRoot
-        if let firstWaterCarveZInRoot {
-            clampedPointInRoot.z = min(firstWaterCarveZInRoot - 0.20, targetPointInRoot.z)
+        var targetPointInFluid = fluidSceneRoot.convert(position: targetPointInRoot, from: rootEntity)
+        if let waterPlacementZClampInFluidSpace {
+            targetPointInFluid.z = min(waterPlacementZClampInFluidSpace, targetPointInFluid.z)
         }
-
-        let targetPointInFluid = fluidSceneRoot.convert(position: clampedPointInRoot, from: rootEntity)
         fluidWaveEntity.position.z = targetPointInFluid.z
     }
 
@@ -616,8 +649,10 @@ struct ContentView: View {
             applyPerformanceGovernor()
 
             // Update sculpting tool and check for tracking quality each frame.
-            _ = content.subscribe(to: SceneEvents.Update.self) {
+            sceneUpdateSubscription?.cancel()
+            sceneUpdateSubscription = content.subscribe(to: SceneEvents.Update.self) {
                 event in
+                guard isContentSceneActive else { return }
                 queueDeferredStartupWorkIfNeeded()
                 scheduleStartupReloadIfNeeded()
                 if sculpting.shouldClearDebris {
@@ -688,12 +723,20 @@ struct ContentView: View {
             Attachment(id: "StylusToolbarPanel") {
                 spatialToolbarPanelAttachment()
             }
-        }.task {
-            // Get transforms of accessories in the app process.
-            let configuration = SpatialTrackingSession.Configuration(tracking: [.accessory])
-            let session = SpatialTrackingSession()
-            await session.run(configuration)
         }
+    }
+
+    @MainActor
+    private func handleScenePhaseChange(_ phase: ScenePhase) {
+        print("[ContentScene] scenePhase=\(String(describing: phase))")
+        let isActive = phase == .active
+        isContentSceneActive = isActive
+
+        if isActive {
+            hasActivatedContentScene = true
+        }
+
+        sculpting.setAccessoryTrackingSceneActive(isActive)
     }
 
     func saveButton() -> some View {
@@ -738,7 +781,7 @@ struct ContentView: View {
             // Load a packaged sculpt volume from app bundle.
             try sculpting.loadBundledPackage(named: "MyVolume")
             applyLoadedVolumePresentationTransform()
-            resetFluidAccumulation()
+            performDebrisReset(resetWaterProbeForReload: true)
             if sculpting.sculptingEntity != nil {
                 sculpting.collisionManager.scheduleRegeneration()
             }
@@ -749,7 +792,7 @@ struct ContentView: View {
                 do {
                     try sculpting.loadFromURL(url)
                     applyLoadedVolumePresentationTransform()
-                    resetFluidAccumulation()
+                    performDebrisReset(resetWaterProbeForReload: true)
                     if sculpting.sculptingEntity != nil {
                         sculpting.collisionManager.scheduleRegeneration()
                     }
@@ -894,7 +937,7 @@ struct ContentView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Camera Pos")
+                    Text("Camera Rot")
                         .font(.caption)
                     HStack {
                         spatialToolbarButton("+45 deg") {
@@ -975,14 +1018,7 @@ struct ContentView: View {
     }
 
     private func handleClearDebris() {
-        sculpting.boneDebrisManager.clearAllDebris()
-        sculpting.sculptingTool.components[SculptingToolComponent.self]?.previousPosition = nil
-        resetFluidAccumulation()
-
-        let voxelVolume = marchingCubesMesh.voxelVolume
-        let slurryBounds = slurryBounds(for: voxelVolume)
-        sculpting.replaceBoneSlurryGrid(volumeBoundsMin: slurryBounds.min,
-                                        volumeBoundsMax: slurryBounds.max)
+        performDebrisReset(resetWaterProbeForReload: false)
     }
 
     func toggleGravityButton() -> some View {
@@ -1091,7 +1127,23 @@ struct ContentView: View {
     //Final Consolidated View
     var body: some View {
         ZStack {
-            sculptingVolume()
+            if hasActivatedContentScene {
+                sculptingVolume()
+            } else {
+                Color.clear
+            }
+        }
+        .onAppear {
+            handleScenePhaseChange(scenePhase)
+        }
+        .onChange(of: scenePhase) { _, newValue in
+            handleScenePhaseChange(newValue)
+        }
+        .onDisappear {
+            sceneUpdateSubscription?.cancel()
+            sceneUpdateSubscription = nil
+            isContentSceneActive = false
+            sculpting.setAccessoryTrackingSceneActive(false)
         }
     }
 }

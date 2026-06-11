@@ -26,13 +26,23 @@ import RealityKit
 
 extension SculptingToolModel {
 
+    nonisolated func spatialAccessoryDebugDescription(for device: GCDevice) -> String {
+        let id = ObjectIdentifier(device)
+        let kind = device is GCStylus ? "stylus" : "controller"
+        let category = device.productCategory
+        let vendor = device.vendorName ?? "unknown-vendor"
+        return "\(kind) vendor=\(vendor) category=\(category) objectID=\(id)"
+    }
+
     func removeSpatialAccessoryAnchor(for accessoryID: ObjectIdentifier) {
+        print("[Accessory] Removing anchor objectID=\(accessoryID) activeID=\(String(describing: activeSpatialAccessoryID)) activeKind=\(String(describing: activeSpatialAccessoryKind))")
         if let anchor = spatialAccessoryAnchors[accessoryID] {
             anchor.removeFromParent()
             if sculptingEntity === anchor {
                 sculptingEntity = nil
                 drillModelEntity = nil
                 drillBallEntity = nil
+                removeShaftCollisionSnapshotDrill()
                 drillModelBaseLocalTransform = nil
                 drillModelDefaultLocalTransform = nil
                 drillBallDefaultLocalTransform = nil
@@ -46,12 +56,43 @@ extension SculptingToolModel {
         }
     }
 
+    func invalidateAccessoryTrackingState() {
+        print("[Accessory] Invalidating accessory tracking state")
+        let accessoryIDs = Array(spatialAccessoryAnchors.keys)
+        for accessoryID in accessoryIDs {
+            removeSpatialAccessoryAnchor(for: accessoryID)
+        }
+        removeShaftCollisionSnapshotDrill()
+        configuredSpatialAccessoryIDs.removeAll()
+        spatialAccessoryAnchors.removeAll()
+        activeSpatialAccessoryID = nil
+        activeSpatialAccessoryKind = nil
+        trackingStateIndicator?.isEnabled = false
+        clearCarvingAndTrackingRuntimeState()
+        hapticsModel?.stopSculptVibration()
+        hapticsModel?.stopShaftCollisionFeedback()
+        updateDrillCarvingAudio(isCarving: false)
+        updateDrillTrackingAudio(for: .untracked)
+        sculptingTool.components[SculptingToolComponent.self]?.isActive = false
+        resetShaftCollisionStateIfNeeded()
+    }
+
     private var shaftCollisionWarningUIColor: UIColor {
         UIColor(red: 1.0, green: 0.76, blue: 0.18, alpha: 1.0)
     }
 
     private var anatomyHazardFlashUIColor: UIColor {
         .red
+    }
+
+    private var activeWarningUIColor: UIColor? {
+        if isAnatomyHazardFlashActive {
+            return anatomyHazardFlashUIColor
+        }
+        if isShaftCollisionWarningActive {
+            return shaftCollisionWarningUIColor
+        }
+        return nil
     }
 
     // MARK: - Drill Shaft Collision Visual Feedback
@@ -88,6 +129,120 @@ extension SculptingToolModel {
         applyDrillWarningAppearance()
     }
 
+    private func setEntityTreeOpacity(_ entity: Entity, opacity: Float) {
+        entity.components.set(OpacityComponent(opacity: opacity))
+        for child in entity.children {
+            setEntityTreeOpacity(child, opacity: opacity)
+        }
+    }
+
+    func setLiveDrillOverlayVisible(_ isVisible: Bool) {
+        let opacity: Float = isVisible ? 1.0 : 0.0
+        if let drillModelEntity {
+            setEntityTreeOpacity(drillModelEntity, opacity: opacity)
+        }
+        if let drillBallEntity {
+            setEntityTreeOpacity(drillBallEntity, opacity: opacity)
+        }
+    }
+
+    private func applyWarningTint(to entity: Entity, color: UIColor) {
+        let warningMaterial = SimpleMaterial(color: color, roughness: 0.3, isMetallic: false)
+        if var model = entity.components[ModelComponent.self] {
+            model.materials = Array(repeating: warningMaterial, count: max(model.materials.count, 1))
+            entity.components.set(model)
+        }
+        for child in entity.children {
+            applyWarningTint(to: child, color: color)
+        }
+    }
+
+    private func removeNamedDescendants(from entity: Entity, named targetName: String) {
+        for child in Array(entity.children) {
+            if child.name == targetName {
+                child.removeFromParent()
+            } else {
+                removeNamedDescendants(from: child, named: targetName)
+            }
+        }
+    }
+
+    func removeShaftCollisionSnapshotDrill() {
+        shaftCollisionSnapshotRoot?.removeFromParent()
+        shaftCollisionSnapshotRoot = nil
+        shaftCollisionSnapshotModel = nil
+        shaftCollisionSnapshotBall = nil
+        isShaftCollisionSnapshotVisible = false
+        setLiveDrillOverlayVisible(true)
+    }
+
+    func rebuildShaftCollisionSnapshotDrillIfNeeded() {
+        guard let root = rootEntity,
+              let drillModelEntity,
+              let drillBallEntity else { return }
+
+        removeShaftCollisionSnapshotDrill()
+
+        let snapshotRoot = Entity()
+        snapshotRoot.name = "ShaftCollisionSnapshotRoot"
+        snapshotRoot.isEnabled = false
+
+        let snapshotModel = drillModelEntity.clone(recursive: true)
+        let snapshotBall = drillBallEntity.clone(recursive: true)
+
+        removeNamedDescendants(from: snapshotModel, named: "DrillTrackingAudioEmitter")
+        removeNamedDescendants(from: snapshotModel, named: "DrillContactAudioEmitter")
+        let initialColor = activeWarningUIColor ?? shaftCollisionWarningUIColor
+        applyWarningTint(to: snapshotModel, color: initialColor)
+        applyWarningTint(to: snapshotBall, color: initialColor)
+        if var rotation = snapshotBall.components[DrillRotationComponent.self] {
+            rotation.rpm = 0
+            snapshotBall.components.set(rotation)
+        }
+
+        snapshotRoot.addChild(snapshotModel)
+        snapshotRoot.addChild(snapshotBall)
+        root.addChild(snapshotRoot)
+
+        shaftCollisionSnapshotRoot = snapshotRoot
+        shaftCollisionSnapshotModel = snapshotModel
+        shaftCollisionSnapshotBall = snapshotBall
+    }
+
+    private func applyShaftCollisionSnapshotWarningAppearance() {
+        guard isShaftCollisionSnapshotVisible else { return }
+        let desiredColor = activeWarningUIColor ?? shaftCollisionWarningUIColor
+        if let snapshotModel = shaftCollisionSnapshotModel {
+            applyWarningTint(to: snapshotModel, color: desiredColor)
+        }
+        if let snapshotBall = shaftCollisionSnapshotBall {
+            applyWarningTint(to: snapshotBall, color: desiredColor)
+        }
+    }
+
+    func showShaftCollisionSnapshot(modelTransform: Transform?, ballTransform: Transform?) {
+        if shaftCollisionSnapshotRoot == nil {
+            rebuildShaftCollisionSnapshotDrillIfNeeded()
+        }
+
+        if let modelTransform {
+            shaftCollisionSnapshotModel?.transform = modelTransform
+        }
+        if let ballTransform {
+            shaftCollisionSnapshotBall?.transform = ballTransform
+        }
+        shaftCollisionSnapshotRoot?.isEnabled = true
+        isShaftCollisionSnapshotVisible = true
+        applyShaftCollisionSnapshotWarningAppearance()
+        setLiveDrillOverlayVisible(false)
+    }
+
+    func hideShaftCollisionSnapshot() {
+        shaftCollisionSnapshotRoot?.isEnabled = false
+        isShaftCollisionSnapshotVisible = false
+        setLiveDrillOverlayVisible(true)
+    }
+
     /// Tint all sculpt mesh chunks to the current warning state.
     func tintSculptMeshRed() {
         isShaftCollisionWarningActive = true
@@ -103,19 +258,13 @@ extension SculptingToolModel {
     func setAnatomyHazardFlashActive(_ isActive: Bool) {
         isAnatomyHazardFlashActive = isActive
         applyDrillWarningAppearance()
+        applyShaftCollisionSnapshotWarningAppearance()
         applySculptMeshWarningAppearance()
         applyAnatomyHazardWarningAppearance()
     }
 
     private func applyDrillWarningAppearance() {
-        let desiredColor: UIColor?
-        if isAnatomyHazardFlashActive {
-            desiredColor = anatomyHazardFlashUIColor
-        } else if isShaftCollisionWarningActive {
-            desiredColor = shaftCollisionWarningUIColor
-        } else {
-            desiredColor = nil
-        }
+        let desiredColor = activeWarningUIColor
 
         guard let desiredColor else {
             guard _isDrillTintedRed else { return }
@@ -167,14 +316,7 @@ extension SculptingToolModel {
             }
         }
 
-        let desiredColor: UIColor?
-        if isAnatomyHazardFlashActive {
-            desiredColor = anatomyHazardFlashUIColor
-        } else if isShaftCollisionWarningActive {
-            desiredColor = shaftCollisionWarningUIColor
-        } else {
-            desiredColor = nil
-        }
+        let desiredColor = activeWarningUIColor
 
         guard let desiredColor else {
             guard _isSculptMeshTintedRed else { return }
@@ -325,6 +467,10 @@ extension SculptingToolModel {
         // Cache original materials for shaft collision tint/restore (model + bit).
         cacheDrillMaterials()
 
+        // Build the pooled warning snapshot once so shaft collision can freeze
+        // a visual copy without touching the live tracked drill hierarchy.
+        rebuildShaftCollisionSnapshotDrillIfNeeded()
+
         // Store the tip offset so updateSculptingTool() can use it for sculpting position.
         drillBallLocalOffset = tipPosition
 
@@ -339,24 +485,30 @@ extension SculptingToolModel {
     // Set up stylus or controller inputs.
     @MainActor
     func setupSpatialAccessory(device: GCDevice, hapticsModel: HapticsModel) async throws {
+        spatialAccessorySetupAttemptCount += 1
         let accessoryID = ObjectIdentifier(device)
         let accessoryKind: SpatialAccessoryKind = (device is GCStylus) ? .stylus : .controller
+        print("[Accessory] setupSpatialAccessory attempt=\(spatialAccessorySetupAttemptCount) \(spatialAccessoryDebugDescription(for: device)) activeKind=\(String(describing: activeSpatialAccessoryKind)) activeID=\(String(describing: activeSpatialAccessoryID)) configuredCount=\(configuredSpatialAccessoryIDs.count)")
 
         if configuredSpatialAccessoryIDs.contains(accessoryID) {
+            print("[Accessory] Skipping setup: exact object already configured \(spatialAccessoryDebugDescription(for: device))")
             return
         }
 
         if activeSpatialAccessoryKind == accessoryKind, sculptingEntity != nil {
+            print("[Accessory] Skipping setup: active accessory of same kind already installed \(String(describing: activeSpatialAccessoryKind))")
             return
         }
 
         if accessoryKind == .controller, activeSpatialAccessoryKind == .stylus {
+            print("[Accessory] Skipping controller setup because stylus is already active")
             return
         }
 
         if accessoryKind == .stylus,
            let activeID = activeSpatialAccessoryID,
            activeSpatialAccessoryKind == .controller {
+            print("[Accessory] Replacing active controller with stylus")
             removeSpatialAccessoryAnchor(for: activeID)
         }
 
@@ -377,6 +529,7 @@ extension SculptingToolModel {
         spatialAccessoryAnchors[accessoryID] = sculptingEntity
         activeSpatialAccessoryID = accessoryID
         activeSpatialAccessoryKind = accessoryKind
+        print("[Accessory] Installed active accessory kind=\(accessoryKind) objectID=\(accessoryID) totalAnchors=\(spatialAccessoryAnchors.count)")
         
         addSculptingTooltip(to: sculptingEntity)
         

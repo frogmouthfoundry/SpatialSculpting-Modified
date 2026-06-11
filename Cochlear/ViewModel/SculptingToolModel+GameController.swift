@@ -10,6 +10,113 @@ import RealityKit
 @preconcurrency import GameController
 
 extension SculptingToolModel {
+    private func hasSupportedSpatialAccessoryPresent() -> Bool {
+        let hasSpatialController = GCController.controllers().contains {
+            $0.productCategory == GCProductCategorySpatialController
+        }
+        let hasSpatialStylus = GCStylus.styli.contains {
+            $0.productCategory == GCProductCategorySpatialStylus
+        }
+        return hasSpatialController || hasSpatialStylus
+    }
+
+    private func scanForSupportedAccessories(hapticsModel: HapticsModel,
+                                             logAsInitialScan: Bool) async {
+        let controllers = GCController.controllers()
+        let styluses = GCStylus.styli
+
+        if logAsInitialScan {
+            print("[Accessory] Initial scan controllers=\(controllers.count) styluses=\(styluses.count)")
+        }
+
+        if controllers.contains(where: { $0.productCategory == GCProductCategorySpatialController }) ||
+            styluses.contains(where: { $0.productCategory == GCProductCategorySpatialStylus }) {
+            ensureAccessoryTrackingSessionRunning()
+        }
+
+        for controller in controllers {
+            if controller.productCategory != GCProductCategorySpatialController {
+                continue
+            }
+
+            print("[Accessory] Initial controller candidate \(spatialAccessoryDebugDescription(for: controller))")
+            try? await setupSpatialAccessory(device: controller, hapticsModel: hapticsModel)
+        }
+
+        for stylus in styluses {
+            if stylus.productCategory != GCProductCategorySpatialStylus {
+                continue
+            }
+
+            print("[Accessory] Initial stylus candidate \(spatialAccessoryDebugDescription(for: stylus))")
+            try? await setupSpatialAccessory(device: stylus, hapticsModel: hapticsModel)
+        }
+    }
+
+    func ensureAccessoryDiscoveryRescanRunning() {
+        guard accessoryTrackingShouldBeRunning else { return }
+        guard accessoryDiscoveryRescanTask == nil else { return }
+        guard let hapticsModel else { return }
+
+        accessoryDiscoveryRescanTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            for attempt in 1...6 {
+                guard self.accessoryTrackingShouldBeRunning else { break }
+                if self.activeSpatialAccessoryKind == .stylus, self.sculptingEntity != nil {
+                    break
+                }
+
+                print("[Accessory] Rescan attempt \(attempt)")
+                await self.scanForSupportedAccessories(hapticsModel: hapticsModel,
+                                                       logAsInitialScan: false)
+
+                if self.activeSpatialAccessoryKind == .stylus, self.sculptingEntity != nil {
+                    break
+                }
+
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+
+            self.accessoryDiscoveryRescanTask = nil
+        }
+    }
+
+    func setAccessoryTrackingSceneActive(_ isActive: Bool) {
+        accessoryTrackingShouldBeRunning = isActive
+
+        if isActive {
+            ensureAccessoryTrackingSessionRunning()
+            ensureAccessoryDiscoveryRescanRunning()
+        } else {
+            accessoryTrackingRestartTask?.cancel()
+            accessoryTrackingRestartTask = nil
+            accessoryDiscoveryRescanTask?.cancel()
+            accessoryDiscoveryRescanTask = nil
+            accessoryTrackingSessionTask?.cancel()
+            accessoryTrackingSessionTask = nil
+            accessoryTrackingSession = nil
+            invalidateAccessoryTrackingState()
+            print("[AccessoryTracking] Scene inactive; accessory tracking paused")
+        }
+    }
+
+    func ensureAccessoryTrackingSessionRunning() {
+        guard accessoryTrackingShouldBeRunning else { return }
+        guard accessoryTrackingSession == nil else { return }
+        guard accessoryTrackingSessionTask == nil else { return }
+        accessoryTrackingSessionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let session = SpatialTrackingSession()
+            let configuration = SpatialTrackingSession.Configuration(tracking: [.accessory])
+            self.accessoryTrackingSession = session
+            print("[AccessoryTracking] Starting accessory tracking session")
+            await session.run(configuration)
+            print("[AccessoryTracking] Accessory tracking session configured")
+            self.accessoryTrackingSessionTask = nil
+        }
+    }
+
     
     // Set up button and haptic inputs for GCStylus.
     @MainActor
@@ -51,28 +158,10 @@ extension SculptingToolModel {
 
     // Handle connections with GCControllers and GCStyluses.
     func handleGameControllerSetup(hapticsModel: HapticsModel) async {
-        let controllers = GCController.controllers()
-        let styluses = GCStylus.styli
-
         self.hapticsModel = hapticsModel
-
-        // Iterate over all the currently connected connections with controllers and styluses.
-        for controller in controllers {
-            // Controllers which do not support spatial accessory tracking should not attempt to start spatial tracking.
-            if controller.productCategory != GCProductCategorySpatialController {
-                continue
-            }
-            
-            try? await setupSpatialAccessory(device: controller, hapticsModel: hapticsModel)
-        }
-        
-        for stylus in styluses {
-            // Styluses which do not support spatial accessory tracking should not attempt to start spatial tracking.
-            if stylus.productCategory != GCProductCategorySpatialStylus {
-                continue
-            }
-            try? await setupSpatialAccessory(device: stylus, hapticsModel: hapticsModel)
-        }
+        await scanForSupportedAccessories(hapticsModel: hapticsModel,
+                                          logAsInitialScan: true)
+        ensureAccessoryDiscoveryRescanRunning()
 
         // Listen to notifications for connections of both controllers and styluses.
         guard !didRegisterAccessoryNotifications else { return }
@@ -82,6 +171,8 @@ extension SculptingToolModel {
             notification in
                 if let controller = notification.object as? GCController,
                    controller.productCategory == GCProductCategorySpatialController {
+                self.ensureAccessoryTrackingSessionRunning()
+                print("[Accessory] Controller connected \(self.spatialAccessoryDebugDescription(for: controller))")
                 Task { @MainActor in
                     try? await self.setupSpatialAccessory(device: controller, hapticsModel: hapticsModel)
                 }
@@ -92,6 +183,8 @@ extension SculptingToolModel {
             notification in
             if let stylus = notification.object as? GCStylus,
                stylus.productCategory == GCProductCategorySpatialStylus {
+                self.ensureAccessoryTrackingSessionRunning()
+                print("[Accessory] Stylus connected \(self.spatialAccessoryDebugDescription(for: stylus))")
                 Task { @MainActor in
                     try? await self.setupSpatialAccessory(device: stylus, hapticsModel: hapticsModel)
                 }
@@ -101,6 +194,7 @@ extension SculptingToolModel {
         NotificationCenter.default.addObserver(forName: NSNotification.Name.GCControllerDidDisconnect, object: nil, queue: nil) {
             notification in
             if let controller = notification.object as? GCController {
+                print("[Accessory] Controller disconnected \(self.spatialAccessoryDebugDescription(for: controller))")
                 Task { @MainActor in
                     self.removeSpatialAccessoryAnchor(for: ObjectIdentifier(controller))
                 }
@@ -110,6 +204,7 @@ extension SculptingToolModel {
         NotificationCenter.default.addObserver(forName: NSNotification.Name.GCStylusDidDisconnect, object: nil, queue: nil) {
             notification in
             if let stylus = notification.object as? GCStylus {
+                print("[Accessory] Stylus disconnected \(self.spatialAccessoryDebugDescription(for: stylus))")
                 Task { @MainActor in
                     self.removeSpatialAccessoryAnchor(for: ObjectIdentifier(stylus))
                 }

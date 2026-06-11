@@ -68,6 +68,14 @@ extension DrillAudioModel {
     func attachSpatialAudio(to drillOverlay: Entity,
                             tipLocalPosition: SIMD3<Float>) {
         prepareAudioIfNeeded()
+        if trackingEmitterEntity?.parent !== drillOverlay {
+            trackingEmitterEntity?.removeFromParent()
+            trackingEmitterEntity = nil
+        }
+        if contactEmitterEntity?.parent !== drillOverlay {
+            contactEmitterEntity?.removeFromParent()
+            contactEmitterEntity = nil
+        }
         if trackingEmitterEntity == nil {
             let trackingEmitter = Entity()
             trackingEmitter.name = "DrillTrackingAudioEmitter"

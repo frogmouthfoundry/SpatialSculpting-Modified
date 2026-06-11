@@ -20,10 +20,11 @@ struct LaunchExperienceView: View {
                 tutorialCard(index: index)
             }
         }
-        .frame(width: LaunchExperienceLayout.scaled(1120),
-               height: LaunchExperienceLayout.scaled(1180))
+        .frame(width: LaunchExperienceLayout.onboardingWindowWidth,
+               height: LaunchExperienceLayout.onboardingWindowHeight)
         .task {
             appModel.prepareOnboardingAssetsIfNeeded()
+            appModel.prepareContentExperienceIfNeeded()
         }
         .onChange(of: appModel.tutorialIndex) { _, _ in
             tutorialAnimationStartDate = .now
@@ -35,54 +36,87 @@ struct LaunchExperienceView: View {
             Spacer(minLength: 0)
 
             ZStack {
-                ForEach(Array(LaunchExperienceContent.homeLayers.enumerated()), id: \.offset) { index, layer in
+                ForEach(Array(LaunchExperienceContent.homeLayers.prefix(3).enumerated()), id: \.offset) { index, layer in
                     Image(layer.assetName)
                         .resizable()
-                        .scaledToFit()
+                        .scaledToFill()
                         .frame(width: LaunchExperienceLayout.homeIllustrationWidth)
+                        .clipped()
+                        .allowsHitTesting(false)
                         .offset(x: LaunchExperienceLayout.cm(layer.xOffsetCM),
                                 y: LaunchExperienceLayout.cm(layer.yOffsetCM))
                         .offset(z: LaunchExperienceLayout.cm(CGFloat(index) * LaunchExperienceLayout.homeLayerDepthSpacingCM))
                 }
+
+                let titleLayers = Array(LaunchExperienceContent.homeLayers.suffix(2))
+                VStack(spacing: LaunchExperienceLayout.scaled(2)) {
+                    Image(titleLayers[0].assetName)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: LaunchExperienceLayout.homeTitleWidth)
+                        .allowsHitTesting(false)
+
+                    Image(titleLayers[1].assetName)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: LaunchExperienceLayout.homeTitleWidth)
+                        .allowsHitTesting(false)
+
+                    Group {
+                        if case let .failed(message) = appModel.onboardingAssetLoadState {
+                            Text(message)
+                                .font(.system(size: LaunchExperienceLayout.scaled(18),
+                                              weight: .regular,
+                                              design: .rounded))
+                                .multilineTextAlignment(.center)
+                                .foregroundStyle(.red)
+                        } else if case let .failed(message) = appModel.contentPreparationState {
+                            Text(message)
+                                .font(.system(size: LaunchExperienceLayout.scaled(18),
+                                              weight: .regular,
+                                              design: .rounded))
+                                .multilineTextAlignment(.center)
+                                .foregroundStyle(.red)
+                        } else if appModel.isHomeStartAvailable {
+                            Button {
+                                appModel.beginTutorial()
+                            } label: {
+                                Text("START")
+                                    .font(.system(size: LaunchExperienceLayout.scaled(30),
+                                                  weight: .semibold,
+                                                  design: .rounded))
+                                    .frame(minWidth: LaunchExperienceLayout.scaled(180))
+                                    .padding(.vertical, LaunchExperienceLayout.scaled(6))
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.white.opacity(0.3))
+                            .foregroundStyle(.white)
+                            .contentShape(Rectangle())
+                        } else {
+                            VStack(spacing: LaunchExperienceLayout.scaled(12)) {
+                                ProgressView()
+                                    .progressViewStyle(.circular)
+                                Text("Loading")
+                                    .font(.system(size: LaunchExperienceLayout.scaled(24),
+                                                  weight: .semibold,
+                                                  design: .rounded))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .frame(minHeight: LaunchExperienceLayout.scaled(56))
+                    .padding(.top, LaunchExperienceLayout.scaled(2))
+                }
+                .frame(width: LaunchExperienceLayout.homeCardWidth,
+                       height: LaunchExperienceLayout.homeCardHeight,
+                       alignment: .top)
+                .padding(.top, LaunchExperienceLayout.homeTitleStackTopInset)
+                .offset(x: LaunchExperienceLayout.cm(titleLayers[0].xOffsetCM),
+                        y: LaunchExperienceLayout.cm(titleLayers[0].yOffsetCM))
+                .offset(z: LaunchExperienceLayout.cm(CGFloat(3) * LaunchExperienceLayout.homeLayerDepthSpacingCM))
             }
             .frame(width: LaunchExperienceLayout.homeCardWidth,
                    height: LaunchExperienceLayout.homeCardHeight)
-            .allowsHitTesting(false)
-
-            VStack(spacing: LaunchExperienceLayout.scaled(12)) {
-                switch appModel.onboardingAssetLoadState {
-                case .idle, .loading:
-                    ProgressView()
-                        .progressViewStyle(.circular)
-                    Text("Loading")
-                        .font(.system(size: LaunchExperienceLayout.scaled(24),
-                                      weight: .semibold,
-                                      design: .rounded))
-                        .foregroundStyle(.secondary)
-                case .ready:
-                    Button {
-                        appModel.beginTutorial()
-                    } label: {
-                        Text("Start")
-                            .font(.system(size: LaunchExperienceLayout.scaled(24),
-                                          weight: .semibold,
-                                          design: .rounded))
-                            .frame(minWidth: LaunchExperienceLayout.scaled(180))
-                            .padding(.vertical, LaunchExperienceLayout.scaled(6))
-                    }
-                    .buttonStyle(.bordered)
-                    .contentShape(Rectangle())
-                case .failed(let message):
-                    Text(message)
-                        .font(.system(size: LaunchExperienceLayout.scaled(18),
-                                      weight: .regular,
-                                      design: .rounded))
-                        .multilineTextAlignment(.center)
-                        .foregroundStyle(.red)
-                }
-            }
-            .frame(minHeight: LaunchExperienceLayout.scaled(120))
-            .padding(.top, LaunchExperienceLayout.cm(LaunchExperienceLayout.homeStartGapBelowLastLayerCM))
 
             Spacer(minLength: 0)
         }
@@ -116,7 +150,7 @@ struct LaunchExperienceView: View {
                     dotIndicator(currentIndex: index)
                         .frame(width: LaunchExperienceLayout.tutorialImageWidth, alignment: .center)
 
-                    VStack(alignment: .trailing, spacing: LaunchExperienceLayout.scaled(10)) {
+                    VStack(alignment: isFinalCard ? .center : .trailing, spacing: LaunchExperienceLayout.scaled(10)) {
                         if isFinalCard && appModel.contentPreparationState == .loading {
                             HStack(spacing: LaunchExperienceLayout.scaled(8)) {
                                 ProgressView()
@@ -141,6 +175,7 @@ struct LaunchExperienceView: View {
 
                         Button {
                             if isFinalCard {
+                                appModel.armContentExperience()
                                 openWindow(id: AppWindowID.contentExperience)
                                 Task { @MainActor in
                                     try? await Task.sleep(for: .milliseconds(150))
@@ -159,7 +194,8 @@ struct LaunchExperienceView: View {
                         .buttonStyle(.bordered)
                         .disabled(isFinalCard && appModel.contentPreparationState != .ready)
                     }
-                    .frame(width: LaunchExperienceLayout.tutorialImageWidth, alignment: .trailing)
+                    .frame(width: LaunchExperienceLayout.tutorialImageWidth,
+                           alignment: isFinalCard ? .center : .trailing)
                 }
             }
             .padding(LaunchExperienceLayout.scaled(42))

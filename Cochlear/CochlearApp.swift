@@ -24,7 +24,10 @@ struct CochlearApp: App {
         .defaultLaunchBehavior(.presented)
 
         WindowGroup(id: AppWindowID.contentExperience) {
-            if let preparedExperience = appModel.preparedExperience {
+            if !appModel.isContentExperienceArmed {
+                Color.clear
+                    .frame(width: 1, height: 1)
+            } else if let preparedExperience = appModel.preparedExperience {
                 ContentView(experience: preparedExperience)
                     .frame(width: 1500, height: 1500)
                     .frame(depth: 1500)

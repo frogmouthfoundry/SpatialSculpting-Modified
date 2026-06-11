@@ -13,7 +13,7 @@ GPU dispatch order each frame:
 */
 
 import RealityKit
-import Metal
+@preconcurrency import Metal
 import UIKit
 import QuartzCore
 
@@ -506,19 +506,6 @@ final class BoneSlurryGrid {
         computeEncoder.dispatchThreadgroups(marchThreadgroups(),
                                             threadsPerThreadgroup: marchThreadsPerThreadgroup)
 
-        // Periodic telemetry
-        let shouldLog = false
-        if shouldLog {
-            let counterBufLocal = counterBuffer
-            let frameNum = debugFrameCounter
-            let particleCountLocal = params.particleCount
-            let maxVertsLocal = params.maxVertexCount
-            computeContext.commandBuffer.addCompletedHandler { _ in
-                let realTriCount = counterBufLocal.contents().load(as: UInt32.self)
-                let status = realTriCount > 0 ? "OK" : "ZERO"
-                print("[BoneSlurryGrid] \(status) frame=\(frameNum) tris=\(realTriCount)/\(maxVertsLocal/3) particles=\(particleCountLocal)")
-            }
-        }
     }
 
     private static func makeLowLevelMesh(vertexCapacity: Int,

@@ -11,14 +11,13 @@ final class VirtualWaterProbeController {
     }
 
     let radius: Float
-    var horizontalReanchorDistance: Float = 0.15
-    var maxReanchorDepthDifference: Float = 0.03
+    var horizontalReanchorDistance: Float = 0.10
     var settleSpeed: Float = 0.02
     var downhillAcceleration: Float = 0.03
     var contactDamping: Float = 8.0
     var freeDamping: Float = 2.5
     var maxLateralSpeed: Float = 0.03
-    var pushoutBias: Float = 0.0005
+    var pushoutBias: Float = 0.0015
     var debugOpacity: CGFloat = 0.85
     var isDebugVisible: Bool = false {
         didSet {
@@ -56,6 +55,7 @@ final class VirtualWaterProbeController {
 
     private var lateralVelocity: SIMD3<Float> = .zero
     private(set) var probePositionInRoot: SIMD3<Float>? = nil
+    private var anchorCarvePositionInRoot: SIMD3<Float>? = nil
     private var debugEntity: ModelEntity? = nil
     private var currentFillDirectionInRoot = simd_normalize(SIMD3<Float>(0, 0, -1))
 
@@ -70,6 +70,7 @@ final class VirtualWaterProbeController {
 
     func reset() {
         probePositionInRoot = nil
+        anchorCarvePositionInRoot = nil
         lateralVelocity = .zero
         debugEntity?.isEnabled = false
     }
@@ -85,6 +86,7 @@ final class VirtualWaterProbeController {
         if isCarving, let carvePositionInRoot {
             if probePositionInRoot == nil || shouldReanchor(to: carvePositionInRoot) {
                 probePositionInRoot = carvePositionInRoot
+                anchorCarvePositionInRoot = carvePositionInRoot
                 lateralVelocity = .zero
             }
         }
@@ -149,11 +151,10 @@ final class VirtualWaterProbeController {
     }
 
     private func shouldReanchor(to carvePositionInRoot: SIMD3<Float>) -> Bool {
-        guard let current = probePositionInRoot else { return true }
-        let xyDistance = simd_length(SIMD2<Float>(carvePositionInRoot.x - current.x,
-                                                  carvePositionInRoot.y - current.y))
-        let depthDifference = abs(carvePositionInRoot.z - current.z)
-        return xyDistance > horizontalReanchorDistance && depthDifference <= maxReanchorDepthDifference
+        guard let anchorCarvePositionInRoot else { return true }
+        let xyDistance = simd_length(SIMD2<Float>(carvePositionInRoot.x - anchorCarvePositionInRoot.x,
+                                                  carvePositionInRoot.y - anchorCarvePositionInRoot.y))
+        return xyDistance >= horizontalReanchorDistance
     }
 
     private func sampleSupport(at center: SIMD3<Float>,

@@ -5,8 +5,6 @@ Abstract:
 Bridging header for sculpting implementation.
 */
 
-#pragma once
-
 #include "Mesh/MeshVertex.h"
 #include "Mesh/MarchingCubesParams.h"
 #include "Sculpting/SculptParams.h"

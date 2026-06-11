@@ -260,7 +260,7 @@ final class BoneDebrisManager {
         pbrMaterial.roughness = .init(floatLiteral: 0.7)
         pbrMaterial.metallic = .init(floatLiteral: 0.0)
         debrisMaterial = pbrMaterial
-        physicsMaterial = try? PhysicsMaterialResource.generate(
+        physicsMaterial = PhysicsMaterialResource.generate(
             staticFriction: 0.5, dynamicFriction: 0.4, restitution: 0.1
         )
 

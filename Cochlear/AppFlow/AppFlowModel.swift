@@ -23,16 +23,20 @@ struct TutorialCardConfiguration {
 
 enum LaunchExperienceLayout {
     // These are intentionally centralized so text/position changes stay quick.
-    static let onboardingScale: CGFloat = 0.7
+    static let onboardingScale: CGFloat = 0.49
     static let pointsPerCentimeter: CGFloat = 26 * onboardingScale
+    static let onboardingWindowWidth: CGFloat = 1120 * onboardingScale
+    static let onboardingWindowHeight: CGFloat = 1180 * onboardingScale
     static let homeLayerDepthSpacingCM: CGFloat = 1
     static let homeStartGapBelowLastLayerCM: CGFloat = 3
+    static let homeTitleStackTopInset: CGFloat = onboardingWindowHeight * 0.4
     static let homeCardWidth: CGFloat = 980 * onboardingScale
     static let homeCardHeight: CGFloat = 880 * onboardingScale
-    static let homeIllustrationWidth: CGFloat = 760 * onboardingScale
+    static let homeIllustrationWidth: CGFloat = homeCardWidth
+    static let homeTitleWidth: CGFloat = onboardingWindowWidth * 0.6
     static let tutorialCardWidth: CGFloat = 980 * onboardingScale
     static let tutorialCardHeight: CGFloat = 920 * onboardingScale
-    static let tutorialImageWidth: CGFloat = 760 * onboardingScale
+    static let tutorialImageWidth: CGFloat = 860 * onboardingScale
     static let tutorialFrameRate: Double = 2
 
     static func cm(_ value: CGFloat) -> CGFloat {
@@ -49,8 +53,8 @@ enum LaunchExperienceContent {
         .init(assetName: "Homecard_-_1-background", xOffsetCM: 0, yOffsetCM: 0),
         .init(assetName: "Homecard_-_2-bone-mesh", xOffsetCM: 0, yOffsetCM: 3),
         .init(assetName: "Homecard_-_3-hand-tool", xOffsetCM: 5, yOffsetCM: 5),
-        .init(assetName: "Homecard_-_4-title-Cochlear", xOffsetCM: 0, yOffsetCM: 11),
-        .init(assetName: "Homecard_-_5-title-virtualsurg", xOffsetCM: 0, yOffsetCM: 14)
+        .init(assetName: "Homecard_-_4-title-Cochlear", xOffsetCM: 0, yOffsetCM: 15),
+        .init(assetName: "Homecard_-_5-title-virtualsurg", xOffsetCM: 0, yOffsetCM: 10)
     ]
 
     static let tutorialCards: [TutorialCardConfiguration] = [
@@ -190,12 +194,13 @@ final class AppFlowModel {
     private(set) var contentPreparationState: ContentPreparationState = .idle
     private(set) var launchPhase: LaunchPhase = .home
     private(set) var preparedExperience: PreparedSculptExperience? = nil
+    private(set) var isContentExperienceArmed: Bool = false
 
     @ObservationIgnored private var onboardingAssetsTask: Task<Void, Never>? = nil
     @ObservationIgnored private var contentPreparationTask: Task<Void, Never>? = nil
 
     var isHomeStartAvailable: Bool {
-        onboardingAssetLoadState == .ready
+        onboardingAssetLoadState == .ready && contentPreparationState == .ready
     }
 
     var tutorialIndex: Int? {
@@ -238,7 +243,6 @@ final class AppFlowModel {
     func beginTutorial() {
         guard isHomeStartAvailable else { return }
         launchPhase = .tutorial(index: 0)
-        prepareContentExperienceIfNeeded()
     }
 
     func advanceTutorial() {
@@ -265,5 +269,9 @@ final class AppFlowModel {
             }
             contentPreparationTask = nil
         }
+    }
+
+    func armContentExperience() {
+        isContentExperienceArmed = true
     }
 }
