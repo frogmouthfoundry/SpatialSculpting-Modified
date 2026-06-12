@@ -11,6 +11,7 @@ import RealityKit
 import GameController
 import CoreHaptics
 import QuartzCore
+import UIKit
 
 private enum ScenePerformanceTier: Equatable {
     case normal
@@ -22,6 +23,16 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     @State private var root: Entity = Entity(components: [ComputeSystemComponent(computeSystem: SculptingToolSystem())])
+    @State private var contentSceneRoot: Entity = {
+        let entity = Entity()
+        entity.name = "ContentSceneRoot"
+        return entity
+    }()
+    @State private var sculptPresentationRoot: Entity = {
+        let entity = Entity()
+        entity.name = "SculptPresentationRoot"
+        return entity
+    }()
     @State private var fluidSceneRoot: Entity = {
         let entity = Entity()
         entity.name = "FluidSceneRoot"
@@ -69,7 +80,8 @@ struct ContentView: View {
     @State private var defaultFluidLayerPosition: SIMD3<Float>? = nil
     @State private var waterProbeController: VirtualWaterProbeController = VirtualWaterProbeController(radius: 0.008)
     @State private var fluidRevealDebrisThreshold: Int = 6
-    @State private var waterPlacementZClampInFluidSpace: Float? = nil
+    @State private var waterPlacementZClampInRootSpace: Float? = nil
+    @State private var waterPlacementAnchorXYInRootSpace: SIMD2<Float>? = nil
     @State private var waterProbeAccumulatedTime: TimeInterval = 0
     @State private var lastFluidRippleTimestamp: TimeInterval = 0
     @State private var isFluidLayerHiddenForDebrisReset: Bool = true
@@ -81,12 +93,19 @@ struct ContentView: View {
     @State private var didScheduleStartupReload: Bool = false
     @State private var isSlurryDebugUIEnabled: Bool = false
     @State private var isWaterDebugUIEnabled: Bool = false
+    @State private var isDebugSectionVisible: Bool = false
     @State private var sceneZoomFactor: Float = 1.0
     @State private var scenePerformanceTier: ScenePerformanceTier = .normal
     @State private var sceneRollAngleRadians: Float = 0
     @State private var sceneUpdateSubscription: EventSubscription? = nil
     @State private var hasActivatedContentScene: Bool = false
     @State private var isContentSceneActive: Bool = false
+    @State private var waterClampDebugBlueEntity: ModelEntity? = nil
+    @State private var waterClampDebugYellowEntity: ModelEntity? = nil
+    @State private var waterProxyDebugRedEntity: ModelEntity? = nil
+
+    private let waterPosGlobalMinZ: Float = -0.15
+    private let waterFixedUpperZ: Float = 0.20
 
     // Volume transparency toggle (50% transparent when on).
     @State private var isVolumeTransparent: Bool = false
@@ -102,6 +121,57 @@ struct ContentView: View {
         meshChunkEntity.components.set(ModelComponent(mesh: mesh, materials: [sculpting.makeSculptMaterial()]))
         meshChunkEntity.name = "SculptMeshChunk"
         return meshChunkEntity
+    }
+
+    private func currentDrillTipPositionInRoot() -> SIMD3<Float>? {
+        guard let rootEntity = sculpting.rootEntity else { return nil }
+        if let drillBallEntity = sculpting.drillBallEntity,
+           let matrix = try? drillBallEntity.transform(from: rootEntity) {
+            return Transform(matrix: simd_float4x4(matrix)).translation
+        }
+        if sculpting.sculptingTool.parent === rootEntity {
+            return sculpting.sculptingTool.position
+        }
+        return nil
+    }
+
+    private func fluidLayerBaseTransform() -> (position: SIMD3<Float>, scale: SIMD3<Float>) {
+        let voxelVolume = marchingCubesMesh.voxelVolume
+        let dims = SIMD3<Float>(voxelVolume.dimensions)
+        let sculptMin = voxelVolume.voxelStartPosition - voxelVolume.voxelSize * 0.5
+        let sculptMax = voxelVolume.voxelStartPosition + voxelVolume.voxelSize * (dims - 0.5)
+        let sculptExtent = sculptMax - sculptMin
+        let presentedScale = volumeScaleFactor
+        let initialFluidZInRoot: Float = 0.04
+        let localCenter = SIMD3<Float>(
+            (sculptMin.x + sculptMax.x) * 0.5,
+            (sculptMin.y + sculptMax.y) * 0.5,
+            (sculptMin.z + sculptMax.z) * 0.5
+        )
+        return (
+            position: SIMD3<Float>(
+                localCenter.x * presentedScale,
+                localCenter.y * presentedScale,
+                initialFluidZInRoot
+            ),
+            scale: SIMD3<Float>(
+                sculptExtent.x * 0.4032 * presentedScale,
+                1.0,
+                sculptExtent.y * 0.4032 * presentedScale
+            )
+        )
+    }
+
+    private func refreshFluidLayerBaseTransform(resetDepth: Bool) {
+        guard let fluidWaveEntity else { return }
+        let base = fluidLayerBaseTransform()
+        fluidWaveEntity.position.x = base.position.x
+        fluidWaveEntity.position.y = base.position.y
+        if resetDepth {
+            fluidWaveEntity.position.z = base.position.z
+        }
+        fluidWaveEntity.scale = base.scale
+        defaultFluidLayerPosition = base.position
     }
 
     private func createFluidLayerIfNeeded() {
@@ -128,28 +198,17 @@ struct ContentView: View {
 
             let entity = ModelEntity(mesh: meshResource, materials: [material])
             entity.name = "FluidLayer"
-            let voxelVolume = marchingCubesMesh.voxelVolume
-            let dims = SIMD3<Float>(voxelVolume.dimensions)
-            let sculptMin = voxelVolume.voxelStartPosition - voxelVolume.voxelSize * 0.5
-            let sculptMax = voxelVolume.voxelStartPosition + voxelVolume.voxelSize * (dims - 0.5)
-            let sculptExtent = sculptMax - sculptMin
-            entity.position = SIMD3<Float>(
-                (sculptMin.x + sculptMax.x) * 0.5,
-                (sculptMin.y + sculptMax.y) * 0.5,
-                sculptMax.z - 0.08
-            )
-            entity.scale = SIMD3<Float>(
-                sculptExtent.x * 0.4032,
-                1.0,
-                sculptExtent.y * 0.4032
-            )
+            entity.components.set(ComputeSystemComponent(computeSystem: waveMesh))
+            let baseTransform = fluidLayerBaseTransform()
+            entity.position = baseTransform.position
+            entity.scale = baseTransform.scale
             entity.orientation = simd_quatf(angle: .pi / 2, axis: SIMD3<Float>(1, 0, 0))
             entity.isEnabled = !isFluidLayerHiddenForDebrisReset
             fluidSceneRoot.addChild(entity)
 
             fluidWaveMesh = waveMesh
             fluidWaveEntity = entity
-            defaultFluidLayerPosition = entity.position
+            defaultFluidLayerPosition = baseTransform.position
             applyPerformanceGovernor()
         } catch {
             print("Failed to create fluid layer: \(error)")
@@ -157,9 +216,6 @@ struct ContentView: View {
     }
 
     private func updateFluidLayer(timestep: TimeInterval) {
-        if fluidWaveMesh?.needsFrameUpdate == true {
-            fluidWaveMesh?.update(timestep)
-        }
         waterProbeAccumulatedTime += timestep
         let waterProbeUpdateInterval = 1.0 / 30.0
         if waterProbeAccumulatedTime >= waterProbeUpdateInterval {
@@ -186,8 +242,12 @@ struct ContentView: View {
 
     private func resetFluidAccumulationForReload() {
         waterProbeController.reset()
-        waterPlacementZClampInFluidSpace = nil
+        waterPlacementZClampInRootSpace = nil
+        waterPlacementAnchorXYInRootSpace = nil
         waterProbeAccumulatedTime = 0
+        waterClampDebugBlueEntity?.isEnabled = false
+        waterClampDebugYellowEntity?.isEnabled = false
+        waterProxyDebugRedEntity?.isEnabled = false
         if let defaultFluidLayerPosition {
             fluidWaveEntity?.position = defaultFluidLayerPosition
         }
@@ -212,14 +272,23 @@ struct ContentView: View {
         replaceSlurryGridForCurrentVolume()
     }
 
+    private func handleFirstDebrisSpawnForWater(_ spawnPositionInRoot: SIMD3<Float>) {
+        guard let rootEntity = sculpting.rootEntity,
+              waterPlacementZClampInRootSpace == nil || waterPlacementAnchorXYInRootSpace == nil else { return }
+
+        let spawnPositionInFluid = fluidSceneRoot.convert(position: spawnPositionInRoot, from: rootEntity)
+        if waterPlacementZClampInRootSpace == nil {
+            waterPlacementZClampInRootSpace = spawnPositionInFluid.z - 0.03
+        }
+        if waterPlacementAnchorXYInRootSpace == nil {
+            waterPlacementAnchorXYInRootSpace = SIMD2<Float>(spawnPositionInFluid.x, spawnPositionInFluid.y)
+        }
+    }
+
     private func updateVirtualWaterProbe(timestep: TimeInterval) {
         guard let rootEntity = sculpting.rootEntity else { return }
 
-        let carvePositionInRoot: SIMD3<Float>? = sculpting.isCurrentlyCarving ? sculpting.sculptingTool.position : nil
-        if let carvePositionInRoot, waterPlacementZClampInFluidSpace == nil {
-            let carvePositionInFluid = fluidSceneRoot.convert(position: carvePositionInRoot, from: rootEntity)
-            waterPlacementZClampInFluidSpace = carvePositionInFluid.z - 0.06
-        }
+        let carvePositionInRoot: SIMD3<Float>? = sculpting.isCurrentlyCarving ? currentDrillTipPositionInRoot() : nil
         waterProbeController.update(rootEntity: rootEntity,
                                     collisionManager: sculpting.collisionManager,
                                     carvePositionInRoot: carvePositionInRoot,
@@ -229,11 +298,40 @@ struct ContentView: View {
         guard let fluidWaveEntity,
               let targetPointInRoot = waterProbeController.waterPlacementPointInRoot else { return }
 
-        var targetPointInFluid = fluidSceneRoot.convert(position: targetPointInRoot, from: rootEntity)
-        if let waterPlacementZClampInFluidSpace {
-            targetPointInFluid.z = min(waterPlacementZClampInFluidSpace, targetPointInFluid.z)
+        let targetPointInFluid = fluidSceneRoot.convert(position: targetPointInRoot, from: rootEntity)
+        let proxyCandidateZ = max(targetPointInFluid.z, waterPosGlobalMinZ)
+        let waterZ = min(waterPlacementZClampInRootSpace ?? proxyCandidateZ,
+                         waterFixedUpperZ,
+                         proxyCandidateZ)
+        let clampedTargetPointInRoot = SIMD3<Float>(
+            waterPlacementAnchorXYInRootSpace?.x ?? targetPointInFluid.x,
+            waterPlacementAnchorXYInRootSpace?.y ?? targetPointInFluid.y,
+            waterZ
+        )
+        fluidWaveEntity.position = clampedTargetPointInRoot
+        updateWaterDebugMarkers(anchorXY: waterPlacementAnchorXYInRootSpace,
+                                clampZ: waterPlacementZClampInRootSpace,
+                                fixedZ: waterFixedUpperZ,
+                                proxyZ: proxyCandidateZ)
+    }
+
+    private func triggerFluidRippleIfNeeded() {
+        guard let waveMesh = fluidWaveMesh,
+              let fluidEntity = fluidWaveEntity,
+              let rootEntity = sculpting.rootEntity,
+              let drillTipPositionInRoot = currentDrillTipPositionInRoot() else { return }
+        guard fluidEntity.isEnabled else { return }
+        let toolPositionInFluidSpace = fluidEntity.convert(position: drillTipPositionInRoot, from: rootEntity)
+        guard abs(toolPositionInFluidSpace.x) < 0.5,
+              abs(toolPositionInFluidSpace.y) < 0.5,
+              abs(toolPositionInFluidSpace.z) < 0.03 else {
+            return
         }
-        fluidWaveEntity.position.z = targetPointInFluid.z
+
+        let now = CACurrentMediaTime()
+        guard now - lastFluidRippleTimestamp > 0.07 else { return }
+        lastFluidRippleTimestamp = now
+        waveMesh.triggerRipple(at: SIMD2<Float>(toolPositionInFluidSpace.x, toolPositionInFluidSpace.y))
     }
 
     private func sculptVolumeLocalBounds() -> (min: SIMD3<Float>, max: SIMD3<Float>)? {
@@ -247,7 +345,7 @@ struct ContentView: View {
     private func sculptVolumePositiveZFacePivotWorld() -> SIMD3<Float> {
         guard let bounds = sculptVolumeLocalBounds() else { return .zero }
         let worldBounds = transformedBounds(corners: boundsCorners(min: bounds.min, max: bounds.max),
-                                            matrix: root.transform.matrix)
+                                            matrix: root.transformMatrix(relativeTo: nil))
         return SIMD3<Float>(
             (worldBounds.min.x + worldBounds.max.x) * 0.5,
             (worldBounds.min.y + worldBounds.max.y) * 0.5,
@@ -262,10 +360,7 @@ struct ContentView: View {
     private func translateScalableSceneRoots(z deltaZ: Float) {
         guard abs(deltaZ) > 0.0001 else { return }
 
-        root.position.z += deltaZ
-        staticSceneRoot.position.z += deltaZ
-        interactiveAnatomyRoot.position.z += deltaZ
-        fluidSceneRoot.position.z += deltaZ
+        contentSceneRoot.position.z += deltaZ
     }
 
     private func syncDrillVisualZoom() {
@@ -299,10 +394,11 @@ struct ContentView: View {
     }
 
     private func applySceneZoomScale() {
-        setUniformScale(root, scale: volumeScaleFactor * sceneZoomFactor)
-        setUniformScale(staticSceneRoot, scale: sceneZoomFactor)
-        setUniformScale(interactiveAnatomyRoot, scale: sceneZoomFactor)
-        setUniformScale(fluidSceneRoot, scale: sceneZoomFactor)
+        setUniformScale(contentSceneRoot, scale: sceneZoomFactor)
+        setUniformScale(root, scale: volumeScaleFactor)
+        setUniformScale(staticSceneRoot, scale: 1.0)
+        setUniformScale(interactiveAnatomyRoot, scale: 1.0)
+        setUniformScale(fluidSceneRoot, scale: 1.0)
     }
 
     private func applySceneZoom(_ newZoomFactor: Float) {
@@ -321,7 +417,9 @@ struct ContentView: View {
     }
 
     private func resetZoomedSceneTransformsToBaseline() {
-        root.transform.translation = .zero
+        contentSceneRoot.transform = Transform()
+        sculptPresentationRoot.transform = Transform()
+        root.transform = Transform()
         staticSceneRoot.transform = Transform()
         interactiveAnatomyRoot.transform = Transform()
         fluidSceneRoot.transform = Transform()
@@ -329,7 +427,7 @@ struct ContentView: View {
 
     private func updateRootGravityFromCurrentRotation() {
         let worldGravity = BoneDebrisManager.debrisGravity
-        let inverseRotation = root.transform.rotation.inverse
+        let inverseRotation = Transform(matrix: root.transformMatrix(relativeTo: nil)).rotation.inverse
         let localGravity = inverseRotation.act(worldGravity)
         var sim = root.components[PhysicsSimulationComponent.self] ?? PhysicsSimulationComponent()
         sim.gravity = localGravity
@@ -340,10 +438,7 @@ struct ContentView: View {
         guard abs(radians) > 0.0001 else { return }
 
         let increment = simd_quatf(angle: radians, axis: SIMD3<Float>(0, 0, 1))
-        root.transform.rotation = increment * root.transform.rotation
-        staticSceneRoot.transform.rotation = increment * staticSceneRoot.transform.rotation
-        interactiveAnatomyRoot.transform.rotation = increment * interactiveAnatomyRoot.transform.rotation
-        fluidSceneRoot.transform.rotation = increment * fluidSceneRoot.transform.rotation
+        contentSceneRoot.transform.rotation = increment * contentSceneRoot.transform.rotation
 
         if updateState {
             sceneRollAngleRadians += radians
@@ -403,22 +498,6 @@ struct ContentView: View {
         .tint(isActive ? .green : .gray)
     }
 
-    private func triggerFluidRippleIfNeeded() {
-        guard let waveMesh = fluidWaveMesh, let fluidEntity = fluidWaveEntity else { return }
-        guard fluidEntity.isEnabled else { return }
-        let toolPositionInFluidSpace = fluidEntity.convert(position: sculpting.sculptingTool.position, from: root)
-        guard abs(toolPositionInFluidSpace.x) < 0.5,
-              abs(toolPositionInFluidSpace.y) < 0.5,
-              abs(toolPositionInFluidSpace.z) < 0.03 else {
-            return
-        }
-
-        let now = CACurrentMediaTime()
-        guard now - lastFluidRippleTimestamp > 0.07 else { return }
-        lastFluidRippleTimestamp = now
-        waveMesh.triggerRipple(at: SIMD2<Float>(toolPositionInFluidSpace.x, toolPositionInFluidSpace.y))
-    }
-
     private func ensureBoneSlurryGridIfNeeded() {
         guard sculpting.boneSlurryGrid == nil,
               !sculpting.boneDebrisManager.drawnEntities.isEmpty else { return }
@@ -442,7 +521,6 @@ struct ContentView: View {
         let desiredFluidSegments = tier == .zoomed ? 64 : 128
         if let waveMesh = fluidWaveMesh, waveMesh.segmentCount != desiredFluidSegments {
             waveMesh.segmentCount = desiredFluidSegments
-            waveMesh.update(0)
         }
 
         sculpting.boneSlurryGrid?.setPerformanceTier(tier == .zoomed ? .zoomed : .normal)
@@ -592,14 +670,23 @@ struct ContentView: View {
             // Initialize visionOS bundled reality-material path (if bundled).
             sculpting.prepareBundledSculptMaterialIfNeeded()
 
+            if contentSceneRoot.parent == nil {
+                content.add(contentSceneRoot)
+            }
+            if sculptPresentationRoot.parent == nil {
+                contentSceneRoot.addChild(sculptPresentationRoot)
+            }
+            if root.parent == nil {
+                sculptPresentationRoot.addChild(root)
+            }
             if staticSceneRoot.parent == nil {
-                content.add(staticSceneRoot)
+                contentSceneRoot.addChild(staticSceneRoot)
             }
             if interactiveAnatomyRoot.parent == nil {
-                content.add(interactiveAnatomyRoot)
+                contentSceneRoot.addChild(interactiveAnatomyRoot)
             }
             if fluidSceneRoot.parent == nil {
-                content.add(fluidSceneRoot)
+                contentSceneRoot.addChild(fluidSceneRoot)
             }
             if accessorySceneRoot.parent == nil {
                 content.add(accessorySceneRoot)
@@ -636,12 +723,14 @@ struct ContentView: View {
             }
             sculpting.boneSlurryGrid?.setDebugRootEntity(root)
 
-            content.add(root)
             sculpting.rootEntity = root
             sculpting.accessoryRootEntity = accessorySceneRoot
 
             // Set up the bone debris manager with the root entity and SDF access.
             sculpting.boneDebrisManager.setup(rootEntity: root, voxelVolume: marchingCubesMesh.voxelVolume)
+            sculpting.boneDebrisManager.onFirstDebrisSpawn = { [self] spawnPositionInRoot in
+                handleFirstDebrisSpawnForWater(spawnPositionInRoot)
+            }
 
             // Set up the collision manager with direct SDF access.
             sculpting.collisionManager.setup(rootEntity: root, voxelVolume: marchingCubesMesh.voxelVolume)
@@ -814,7 +903,7 @@ struct ContentView: View {
         sceneZoomFactor = 1.0
         sceneRollAngleRadians = 0
         resetZoomedSceneTransformsToBaseline()
-        root.transform.rotation = simd_quatf(angle: (.pi * 3.0) / 2.0, axis: SIMD3<Float>(0, 1, 0))
+        sculptPresentationRoot.transform.rotation = simd_quatf(angle: (.pi * 3.0) / 2.0, axis: SIMD3<Float>(0, 1, 0))
         volumeScaleFactor = 0.75
         applyVolumeScale(volumeScaleFactor)
         if abs(preservedZoomFactor - 1.0) > 0.0001 {
@@ -825,6 +914,7 @@ struct ContentView: View {
         } else {
             updateRootGravityFromCurrentRotation()
         }
+        refreshFluidLayerBaseTransform(resetDepth: true)
     }
 
     func clearButton() -> some View {
@@ -880,7 +970,85 @@ struct ContentView: View {
 
     private func setWaterDebugEnabled(_ isEnabled: Bool) {
         isWaterDebugUIEnabled = isEnabled
-        waterProbeController.isDebugVisible = isEnabled
+        waterProbeController.isDebugVisible = false
+        waterClampDebugBlueEntity?.isEnabled = isEnabled && waterPlacementAnchorXYInRootSpace != nil && waterPlacementZClampInRootSpace != nil
+        waterClampDebugYellowEntity?.isEnabled = isEnabled && waterPlacementAnchorXYInRootSpace != nil
+        waterProxyDebugRedEntity?.isEnabled = isEnabled && waterPlacementAnchorXYInRootSpace != nil
+    }
+
+    private func setDebugSectionVisible(_ isVisible: Bool) {
+        isDebugSectionVisible = isVisible
+        guard !isVisible else { return }
+
+        if isVolumeTransparent {
+            isVolumeTransparent = false
+            applyVolumeTransparency(false)
+        }
+        if isSlurryDebugUIEnabled {
+            setSlurryDebugEnabled(false)
+        }
+        if isWaterDebugUIEnabled {
+            setWaterDebugEnabled(false)
+        }
+    }
+
+    private func makeWaterDebugCube(color: UIColor) -> ModelEntity {
+        let material = SimpleMaterial(color: color.withAlphaComponent(0.9),
+                                      roughness: 0.2,
+                                      isMetallic: false)
+        let cube = ModelEntity(mesh: .generateBox(size: 0.01), materials: [material])
+        cube.isEnabled = false
+        return cube
+    }
+
+    private func ensureWaterDebugMarkers() {
+        if waterClampDebugBlueEntity == nil {
+            let entity = makeWaterDebugCube(color: .blue)
+            entity.name = "WaterClampBlueDebugCube"
+            fluidSceneRoot.addChild(entity)
+            waterClampDebugBlueEntity = entity
+        }
+        if waterClampDebugYellowEntity == nil {
+            let entity = makeWaterDebugCube(color: .yellow)
+            entity.name = "WaterClampYellowDebugCube"
+            fluidSceneRoot.addChild(entity)
+            waterClampDebugYellowEntity = entity
+        }
+        if waterProxyDebugRedEntity == nil {
+            let material = SimpleMaterial(color: UIColor.red.withAlphaComponent(0.9),
+                                          roughness: 0.2,
+                                          isMetallic: false)
+            let entity = ModelEntity(mesh: .generateSphere(radius: 0.008), materials: [material])
+            entity.name = "WaterProxyRedDebugSphere"
+            entity.isEnabled = false
+            fluidSceneRoot.addChild(entity)
+            waterProxyDebugRedEntity = entity
+        }
+    }
+
+    private func updateWaterDebugMarkers(anchorXY: SIMD2<Float>?,
+                                         clampZ: Float?,
+                                         fixedZ: Float,
+                                         proxyZ: Float) {
+        ensureWaterDebugMarkers()
+        guard isWaterDebugUIEnabled, let anchorXY else {
+            waterClampDebugBlueEntity?.isEnabled = false
+            waterClampDebugYellowEntity?.isEnabled = false
+            waterProxyDebugRedEntity?.isEnabled = false
+            return
+        }
+
+        waterClampDebugYellowEntity?.position = SIMD3<Float>(anchorXY.x, anchorXY.y, fixedZ)
+        waterClampDebugYellowEntity?.isEnabled = true
+        waterProxyDebugRedEntity?.position = SIMD3<Float>(anchorXY.x, anchorXY.y, proxyZ)
+        waterProxyDebugRedEntity?.isEnabled = true
+
+        if let clampZ {
+            waterClampDebugBlueEntity?.position = SIMD3<Float>(anchorXY.x, anchorXY.y, clampZ)
+            waterClampDebugBlueEntity?.isEnabled = true
+        } else {
+            waterClampDebugBlueEntity?.isEnabled = false
+        }
     }
 
     private func spatialToolbarButton(_ title: String,
@@ -966,28 +1134,37 @@ struct ContentView: View {
                     Text("Debug")
                         .font(.caption)
                     HStack {
-                        spatialToolbarButton("Xray", isActive: isVolumeTransparent) {
-                            isVolumeTransparent.toggle()
-                            applyVolumeTransparency(isVolumeTransparent)
-                        }
-                        spatialToolbarButton("Slurry Grid", isActive: isSlurryDebugUIEnabled) {
-                            setSlurryDebugEnabled(!isSlurryDebugUIEnabled)
-                        }
-                        spatialToolbarButton("Water Pos", isActive: isWaterDebugUIEnabled) {
-                            setWaterDebugEnabled(!isWaterDebugUIEnabled)
+                        spatialToolbarButton(isDebugSectionVisible ? "Debug ON" : "Debug Off",
+                                             isActive: isDebugSectionVisible) {
+                            setDebugSectionVisible(!isDebugSectionVisible)
                         }
                     }
-                }
 
-                HStack {
-                    spatialToolbarButton("Rot X") {
-                        rotateVolume(axis: SIMD3<Float>(1, 0, 0))
-                    }
-                    spatialToolbarButton("Rot Y") {
-                        rotateVolume(axis: SIMD3<Float>(0, 1, 0))
-                    }
-                    spatialToolbarButton("Rot Z") {
-                        rotateVolume(axis: SIMD3<Float>(0, 0, 1))
+                    if isDebugSectionVisible {
+                        HStack {
+                            spatialToolbarButton("Xray", isActive: isVolumeTransparent) {
+                                isVolumeTransparent.toggle()
+                                applyVolumeTransparency(isVolumeTransparent)
+                            }
+                            spatialToolbarButton("Slurry Grid", isActive: isSlurryDebugUIEnabled) {
+                                setSlurryDebugEnabled(!isSlurryDebugUIEnabled)
+                            }
+                            spatialToolbarButton("Water Pos", isActive: isWaterDebugUIEnabled) {
+                                setWaterDebugEnabled(!isWaterDebugUIEnabled)
+                            }
+                        }
+
+                        HStack {
+                            spatialToolbarButton("Rot X") {
+                                rotateVolume(axis: SIMD3<Float>(1, 0, 0))
+                            }
+                            spatialToolbarButton("Rot Y") {
+                                rotateVolume(axis: SIMD3<Float>(0, 1, 0))
+                            }
+                            spatialToolbarButton("Rot Z") {
+                                rotateVolume(axis: SIMD3<Float>(0, 0, 1))
+                            }
+                        }
                     }
                 }
             }
@@ -1099,7 +1276,7 @@ struct ContentView: View {
     /// Scale the sculpting volume (mesh chunks + bone slurry + collision) uniformly.
     /// The base scale combines with the scene zoom factor.
     private func applyVolumeScale(_ scale: Float) {
-        root.transform.scale = SIMD3<Float>(repeating: scale * sceneZoomFactor)
+        root.transform.scale = SIMD3<Float>(repeating: scale)
     }
 
     func shrinkVolumeButton() -> some View {

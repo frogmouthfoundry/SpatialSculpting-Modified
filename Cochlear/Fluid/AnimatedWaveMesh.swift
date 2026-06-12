@@ -6,10 +6,9 @@ import Metal
 import RealityKit
 
 @MainActor
-final class AnimatedWaveMesh {
+final class AnimatedWaveMesh: ComputeSystem {
     enum Error: Swift.Error {
         case missingMetalDevice
-        case missingCommandQueue
         case missingVertexPipeline
         case missingIndexPipeline
     }
@@ -25,7 +24,6 @@ final class AnimatedWaveMesh {
         didSet { needsTopologyUpdate = true }
     }
 
-    private let commandQueue: MTLCommandQueue
     private let updateVerticesPipeline: MTLComputePipelineState
     private let updateIndicesPipeline: MTLComputePipelineState
     private var needsTopologyUpdate: Bool = true
@@ -42,9 +40,6 @@ final class AnimatedWaveMesh {
 
     init() throws {
         guard metalDevice != nil else { throw Error.missingMetalDevice }
-        guard let queue = makeCommandQueue(labeled: "Animated Wave Mesh Queue") else {
-            throw Error.missingCommandQueue
-        }
         guard let verticesPipeline = makeComputePipeline(named: "update_wave_vertices") else {
             throw Error.missingVertexPipeline
         }
@@ -52,7 +47,6 @@ final class AnimatedWaveMesh {
             throw Error.missingIndexPipeline
         }
 
-        self.commandQueue = queue
         self.updateVerticesPipeline = verticesPipeline
         self.updateIndicesPipeline = indicesPipeline
 
@@ -76,8 +70,6 @@ final class AnimatedWaveMesh {
             indexType: .uint32
         )
         self.lowLevelMesh = try LowLevelMesh(descriptor: descriptor)
-
-        update(0.0)
     }
 
     func triggerRipple(at localPoint: SIMD2<Float>) {
@@ -87,16 +79,8 @@ final class AnimatedWaveMesh {
         rippleTime = 0
     }
 
-    func update(_ timestep: TimeInterval) {
+    private func advanceSimulation(_ timestep: TimeInterval) {
         time += timestep
-
-        guard let updateCommandBuffer = commandQueue.makeCommandBuffer(),
-              let commandEncoder = updateCommandBuffer.makeComputeCommandEncoder() else {
-            return
-        }
-
-        let activeSegmentCount = max(0, min(segmentCount, maxSegmentCount))
-        let indexCount = activeSegmentCount * activeSegmentCount * 6
 
         if ripplePoint != nil {
             rippleTime += Float(timestep)
@@ -105,6 +89,19 @@ final class AnimatedWaveMesh {
                 rippleTime = 0
             }
         }
+    }
+
+    func update(computeContext: inout ComputeUpdateContext) {
+        guard needsFrameUpdate else { return }
+
+        advanceSimulation(computeContext.sceneUpdateContext.deltaTime)
+
+        guard let commandEncoder = computeContext.computeEncoder() else {
+            return
+        }
+
+        let activeSegmentCount = max(0, min(segmentCount, maxSegmentCount))
+        let indexCount = activeSegmentCount * activeSegmentCount * 6
 
         var waveDescriptor = WaveDescriptor(
             segmentCount: UInt32(activeSegmentCount),
@@ -126,7 +123,7 @@ final class AnimatedWaveMesh {
 
         commandEncoder.setBytes(&waveDescriptor, length: MemoryLayout<WaveDescriptor>.size, index: 1)
 
-        let vertexBuffer = lowLevelMesh.replace(bufferIndex: 0, using: updateCommandBuffer)
+        let vertexBuffer = lowLevelMesh.replace(bufferIndex: 0, using: computeContext.commandBuffer)
         commandEncoder.setComputePipelineState(updateVerticesPipeline)
         commandEncoder.setBuffer(vertexBuffer, offset: 0, index: 0)
         let vertexThreads = MTLSize(width: activeSegmentCount + 1, height: activeSegmentCount + 1, depth: 1)
@@ -142,7 +139,7 @@ final class AnimatedWaveMesh {
         }
 
         if needsTopologyUpdate {
-            let indexBuffer = lowLevelMesh.replaceIndices(using: updateCommandBuffer)
+            let indexBuffer = lowLevelMesh.replaceIndices(using: computeContext.commandBuffer)
             commandEncoder.setComputePipelineState(updateIndicesPipeline)
             commandEncoder.setBuffer(indexBuffer, offset: 0, index: 0)
             let indexThreads = MTLSize(width: activeSegmentCount, height: activeSegmentCount, depth: 1)
@@ -168,8 +165,5 @@ final class AnimatedWaveMesh {
             ])
             needsTopologyUpdate = false
         }
-
-        commandEncoder.endEncoding()
-        updateCommandBuffer.commit()
     }
 }

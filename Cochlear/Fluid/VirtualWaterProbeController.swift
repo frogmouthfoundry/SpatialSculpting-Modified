@@ -12,6 +12,7 @@ final class VirtualWaterProbeController {
 
     let radius: Float
     var horizontalReanchorDistance: Float = 0.10
+    var initialAnchorOffsetDistance: Float = 0.15
     var settleSpeed: Float = 0.02
     var downhillAcceleration: Float = 0.03
     var contactDamping: Float = 8.0
@@ -23,13 +24,13 @@ final class VirtualWaterProbeController {
         didSet {
             if !isDebugVisible {
                 debugEntity?.isEnabled = false
-            } else if let probePositionInRoot {
-                updateDebugEntity(positionInRoot: probePositionInRoot)
+            } else if let debugPositionInRoot = waterPlacementPointInRoot ?? probePositionInRoot {
+                updateDebugEntity(positionInRoot: debugPositionInRoot)
             }
         }
     }
 
-    private let desiredWorldFillDirection = simd_normalize(SIMD3<Float>(0, 0, -1))
+    private let desiredRootFillDirection = simd_normalize(SIMD3<Float>(0, 0, -1))
     private let contactSampleCountThreshold: Int = 2
     private let deepPenetrationThreshold: Float = 0.001
     private let supportOffsets: [SIMD3<Float>] = [
@@ -81,11 +82,11 @@ final class VirtualWaterProbeController {
                 isCarving: Bool,
                 timestep: TimeInterval) {
         ensureDebugEntity(in: rootEntity)
-        currentFillDirectionInRoot = rootLocalFillDirection(for: rootEntity)
+        currentFillDirectionInRoot = desiredRootFillDirection
 
         if isCarving, let carvePositionInRoot {
             if probePositionInRoot == nil || shouldReanchor(to: carvePositionInRoot) {
-                probePositionInRoot = carvePositionInRoot
+                probePositionInRoot = carvePositionInRoot + currentFillDirectionInRoot * initialAnchorOffsetDistance
                 anchorCarvePositionInRoot = carvePositionInRoot
                 lateralVelocity = .zero
             }
@@ -108,7 +109,7 @@ final class VirtualWaterProbeController {
 
         guard collisionManager.hasSDFCache else {
             probePositionInRoot = currentPosition
-            updateDebugEntity(positionInRoot: currentPosition)
+            updateDebugEntity(positionInRoot: waterPlacementPointInRoot ?? currentPosition)
             return
         }
 
@@ -146,8 +147,14 @@ final class VirtualWaterProbeController {
             }
         }
 
+        currentPosition = constrainCenterToSurfaceIfNeeded(currentPosition,
+                                                           collisionManager: collisionManager)
+        if let anchorCarvePositionInRoot {
+            currentPosition.x = anchorCarvePositionInRoot.x
+            currentPosition.y = anchorCarvePositionInRoot.y
+        }
         probePositionInRoot = currentPosition
-        updateDebugEntity(positionInRoot: currentPosition)
+        updateDebugEntity(positionInRoot: waterPlacementPointInRoot ?? currentPosition)
     }
 
     private func shouldReanchor(to carvePositionInRoot: SIMD3<Float>) -> Bool {
@@ -203,6 +210,29 @@ final class VirtualWaterProbeController {
                                    contactNormal: contactNormal)
     }
 
+    private func constrainCenterToSurfaceIfNeeded(_ center: SIMD3<Float>,
+                                                  collisionManager: CollisionManager) -> SIMD3<Float> {
+        guard let centerSDF = collisionManager.sampleSDF(at: center) else {
+            return center
+        }
+
+        // For a sphere of radius r, the center should remain at least r away from
+        // the surface in SDF space. If it gets closer than that, project it back out.
+        let requiredCenterSDF = radius + pushoutBias
+        guard centerSDF < requiredCenterSDF else {
+            return center
+        }
+
+        let gradient = collisionManager.sampleSDFGradient(at: center)
+        let outwardNormal: SIMD3<Float>
+        if simd_length_squared(gradient) > 1e-10 {
+            outwardNormal = simd_normalize(gradient)
+        } else {
+            outwardNormal = -currentFillDirectionInRoot
+        }
+        return center + outwardNormal * (requiredCenterSDF - centerSDF)
+    }
+
     private func ensureDebugEntity(in rootEntity: Entity) {
         guard debugEntity == nil else { return }
         let material = SimpleMaterial(color: .red.withAlphaComponent(debugOpacity),
@@ -214,14 +244,6 @@ final class VirtualWaterProbeController {
         entity.isEnabled = false
         rootEntity.addChild(entity)
         debugEntity = entity
-    }
-
-    private func rootLocalFillDirection(for rootEntity: Entity) -> SIMD3<Float> {
-        let localDirection = rootEntity.transform.rotation.inverse.act(desiredWorldFillDirection)
-        if simd_length_squared(localDirection) > 1e-8 {
-            return simd_normalize(localDirection)
-        }
-        return simd_normalize(SIMD3<Float>(0, 0, -1))
     }
 
     private func updateDebugEntity(positionInRoot: SIMD3<Float>) {

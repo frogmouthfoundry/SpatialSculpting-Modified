@@ -188,6 +188,7 @@ final class BoneDebrisManager {
     private var pooledDebrisEntities: [ModelEntity] = []
     private let pooledDebrisLimit: Int = 100
     private var performanceTier: BoneDebrisPerformanceTier = .normal
+    var onFirstDebrisSpawn: ((SIMD3<Float>) -> Void)?
 
     weak var rootEntity: Entity?
     private var debrisContainer: Entity?
@@ -496,6 +497,9 @@ final class BoneDebrisManager {
         container.addChild(boxEntity)
         drawnEntities.append(boxEntity)
         spawnedDebrisSinceLastClear += 1
+        if spawnedDebrisSinceLastClear == 1 {
+            onFirstDebrisSpawn?(offsetPosition)
+        }
 
         // Initialize settling state, growth multiplier, and spawn time.
         let entityId = ObjectIdentifier(boxEntity)
